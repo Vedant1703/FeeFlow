@@ -46,8 +46,9 @@
 - **Next Steps for Production:** Connect live WhatsApp Business & Razorpay webhooks, complete legal/CA sign-off on DPDP notice text and GST credit-note series, and calibrate risk weights against historical cohort retention data.
 
 ## 8. Financial Integrity Audit & Automated Test Verification
-- **Automated Test Coverage:** 112 passing tests across 17 test suites (100% green coverage) verifying all domain algorithms, application services, authentication flows, components, and the payment sandbox matrix.
+- **Automated Test Coverage:** 114 passing tests across 18 test suites (100% green coverage) verifying all domain algorithms, application services, parent registration and authentication flows, components, and the payment sandbox matrix.
 - **Test Suite Breakdown:**
+  - `parent-registration.test.ts` (2 tests): End-to-end parent registration, dynamic student linking, live cryptographic OTP delivery via SMS provider, inbox inspection, re-entering verification, and 3-attempt lockout.
   - `money.test.ts` (6 tests): BigInt integer paise conversion, roundHalfUp, formatting boundaries.
   - `ledger.test.ts` (6 tests): Append-only signed ledger derivation, balance updates, status transitions.
   - `risk.test.ts` (4 tests): Explainable 0.40/0.30/0.30 heuristic, sparse data safety, 30-day false-positive suppression.

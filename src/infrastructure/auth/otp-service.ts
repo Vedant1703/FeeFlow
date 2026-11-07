@@ -284,16 +284,31 @@ export class OtpService {
       };
     }
 
-    // Retrieve active token for phone
+    // 1. Try finding active token in database if available
+    let dbToken: any = null;
+    try {
+      dbToken = await prisma.otpToken.findFirst({
+        where: {
+          phone,
+          consumed: false,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+    } catch {
+      // In-memory fallback handles offline testing & demo mode gracefully
+    }
+
+    // 2. Retrieve in-memory token
     const tokens = this.inMemoryTokens.get(phone) || [];
-    // Find latest non-consumed token
-    let activeToken: InMemoryOtpRecord | undefined;
+    let memToken: InMemoryOtpRecord | undefined;
     for (let i = tokens.length - 1; i >= 0; i--) {
       if (!tokens[i].consumed) {
-        activeToken = tokens[i];
+        memToken = tokens[i];
         break;
       }
     }
+
+    const activeToken = dbToken || memToken;
 
     if (!activeToken) {
       return {
@@ -302,8 +317,13 @@ export class OtpService {
       };
     }
 
+    const expiresAtMs =
+      activeToken.expiresAt instanceof Date
+        ? activeToken.expiresAt.getTime()
+        : new Date(activeToken.expiresAt).getTime();
+
     // Check expiry
-    if (now > activeToken.expiresAt.getTime()) {
+    if (now > expiresAtMs) {
       return {
         success: false,
         error: "OTP has expired. Please request a new OTP.",
@@ -329,6 +349,19 @@ export class OtpService {
 
     if (!isValid) {
       activeToken.attempts += 1;
+      if (memToken && memToken !== activeToken) {
+        memToken.attempts += 1;
+      }
+
+      if (dbToken) {
+        try {
+          await prisma.otpToken.update({
+            where: { id: dbToken.id },
+            data: { attempts: { increment: 1 } },
+          });
+        } catch {}
+      }
+
       const attemptsRemaining = activeToken.maxAttempts - activeToken.attempts;
 
       if (attemptsRemaining <= 0) {
@@ -350,7 +383,17 @@ export class OtpService {
     }
 
     // Success: Mark consumed immediately (single-use invariant)
-    activeToken.consumed = true;
+    if (memToken) {
+      memToken.consumed = true;
+    }
+    if (dbToken) {
+      try {
+        await prisma.otpToken.update({
+          where: { id: dbToken.id },
+          data: { consumed: true },
+        });
+      } catch {}
+    }
 
     return {
       success: true,

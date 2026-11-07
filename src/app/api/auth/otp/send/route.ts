@@ -67,7 +67,9 @@ export async function POST(req: Request) {
     if (!parent) {
       return NextResponse.json(
         {
-          error: "This mobile number is not registered with any student. In demo mode, use +91 90000 12345.",
+          error: "This mobile number is not registered with any student. Please register your parent account.",
+          notRegistered: true,
+          phone: cleanPhone,
         },
         { status: 404 }
       );
@@ -85,13 +87,16 @@ export async function POST(req: Request) {
       );
     }
 
+    const effectiveCode = otpRes.demoCode || "482913";
+
     return NextResponse.json({
       success: true,
       phone: parent.phone,
       resendAfterSeconds: otpRes.resendAfterSeconds,
-      demoCode: "482913",
-      generatedCode: otpRes.demoCode,
-      message: "6-digit OTP code sent. In demo mode, enter code 482913.",
+      code: effectiveCode,
+      demoCode: effectiveCode,
+      generatedCode: effectiveCode,
+      message: `6-digit OTP code sent. In demo mode, enter code ${effectiveCode}.`,
     });
   } catch (err: any) {
     return NextResponse.json(

@@ -17,7 +17,7 @@ describe("Authentication & Session API Integration Tests", () => {
 
       expect(res.status).toBe(200);
       expect(data.success).toBe(true);
-      expect(data.demoCode).toBe("482913");
+      expect(data.demoCode).toMatch(/^\d{6}$/);
       expect(data.phone).toContain("9000012345");
     });
 

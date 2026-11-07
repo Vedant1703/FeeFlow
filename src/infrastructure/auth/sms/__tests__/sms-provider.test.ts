@@ -46,3 +46,4 @@ describe("Infrastructure: SMS Provider Port & Mock Adapter", () => {
     expect(defaultProvider.name).toBe("MOCK_SMS");
   });
 });
+

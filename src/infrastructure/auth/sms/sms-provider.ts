@@ -71,6 +71,11 @@ export class MockSmsProvider implements SmsProvider {
   }
 
   getLastOtp(phone: string): string | undefined {
+    const rec = this.getLatestMessage(phone);
+    return rec?.otp;
+  }
+
+  getLatestMessage(phone: string): SentSmsRecord | undefined {
     const clean = phone.replace(/[^\d+]/g, "");
     const last10 = clean.slice(-10);
 
@@ -78,7 +83,7 @@ export class MockSmsProvider implements SmsProvider {
       const rec = this.history[i];
       const recClean = rec.phone.replace(/[^\d+]/g, "");
       if (recClean === clean || recClean.slice(-10) === last10) {
-        return rec.otp;
+        return rec;
       }
     }
     return undefined;
@@ -106,3 +111,4 @@ export function getSmsProvider(): SmsProvider {
 
   return mockSmsProvider;
 }
+

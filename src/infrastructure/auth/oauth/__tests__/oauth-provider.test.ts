@@ -72,3 +72,4 @@ describe("Infrastructure: OAuth 2.0 PKCE Provider Port & Adapters", () => {
     expect(provider.name).toBe("MOCK_OAUTH"); // In demo mode
   });
 });
+

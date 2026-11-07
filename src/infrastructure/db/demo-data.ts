@@ -129,6 +129,22 @@ export function findDemoParentByPhone(phone: string): DemoParent | null {
   );
 }
 
+export function addDemoParent(parent: DemoParent): void {
+  const newClean = parent.phone.replace(/[^\d+]/g, "");
+  const newLast10 = newClean.slice(-10);
+
+  const existingIdx = DEMO_PARENTS.findIndex((p) => {
+    const pClean = p.phone.replace(/[^\d+]/g, "");
+    return pClean === newClean || pClean.slice(-10) === newLast10;
+  });
+
+  if (existingIdx >= 0) {
+    DEMO_PARENTS[existingIdx] = parent;
+  } else {
+    DEMO_PARENTS.push(parent);
+  }
+}
+
 export function findDemoUserByEmail(email: string): DemoStaffUser | null {
   const normalized = email.toLowerCase().trim();
   return DEMO_STAFF_USERS.find((u) => u.email.toLowerCase() === normalized) || null;
