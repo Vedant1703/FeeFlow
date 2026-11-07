@@ -343,9 +343,9 @@ export class OtpService {
       return {
         success: false,
         attemptsRemaining,
-        error: `Incorrect OTP code. You have ${attemptsRemaining} ${
+        error: `Wrong code. You have ${attemptsRemaining} ${
           attemptsRemaining === 1 ? "attempt" : "attempts"
-        } remaining.`,
+        } remaining. In demo mode, use 482913.`,
       };
     }
 

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/infrastructure/db/prisma";
 import { findDemoParentByPhone } from "@/infrastructure/db/demo-data";
+import { otpService, normalizeIndianPhoneNumber } from "@/infrastructure/auth/otp-service";
 
 export async function POST(req: Request) {
   try {
@@ -11,9 +12,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Phone number is required" }, { status: 400 });
     }
 
-    // Clean phone number (e.g. +91 90000 12345 -> +919000012345)
-    const cleanPhone = phone.replace(/[^\d+]/g, "");
+    const norm = normalizeIndianPhoneNumber(phone);
+    if (!norm.isValid) {
+      return NextResponse.json({ error: norm.error }, { status: 400 });
+    }
 
+    const cleanPhone = norm.normalized;
     let parent: any = null;
 
     try {
@@ -31,7 +35,7 @@ export async function POST(req: Request) {
           },
         },
       });
-    } catch (dbError) {
+    } catch {
       // In demo mode or offline, fallback to in-memory demo data
       const demo = findDemoParentByPhone(cleanPhone);
       if (demo) {
@@ -64,11 +68,24 @@ export async function POST(req: Request) {
       );
     }
 
-    // Demo Mode: Demo OTP is fixed to 482913 and disclosed in response
+    // Request cryptographically secure OTP with rate limiting & cooldown
+    const otpRes = await otpService.requestOtp(cleanPhone);
+    if (!otpRes.success) {
+      return NextResponse.json(
+        {
+          error: otpRes.error || "Failed to generate OTP",
+          waitSeconds: otpRes.resendAfterSeconds,
+        },
+        { status: 429 }
+      );
+    }
+
     return NextResponse.json({
       success: true,
       phone: parent.phone,
+      resendAfterSeconds: otpRes.resendAfterSeconds,
       demoCode: "482913",
+      generatedCode: otpRes.demoCode,
       message: "6-digit OTP code sent. In demo mode, enter code 482913.",
     });
   } catch (err: any) {

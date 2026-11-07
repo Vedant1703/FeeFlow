@@ -3,6 +3,7 @@ import { prisma } from "@/infrastructure/db/prisma";
 import { createSessionToken, SESSION_COOKIE_NAME } from "@/infrastructure/auth/session";
 import { Actor } from "@/application/actor";
 import { findDemoParentByPhone } from "@/infrastructure/db/demo-data";
+import { otpService, normalizeIndianPhoneNumber } from "@/infrastructure/auth/otp-service";
 
 export async function POST(req: Request) {
   try {
@@ -16,15 +17,25 @@ export async function POST(req: Request) {
       );
     }
 
-    // Verify code: In demo mode, accept 482913
-    if (code !== "482913") {
+    const norm = normalizeIndianPhoneNumber(phone);
+    if (!norm.isValid) {
+      return NextResponse.json({ error: norm.error }, { status: 400 });
+    }
+
+    const cleanPhone = norm.normalized;
+
+    // Verify OTP with cryptographic HMAC verification and 3-attempt lockout
+    const verifyRes = await otpService.verifyOtp(cleanPhone, code);
+    if (!verifyRes.success) {
       return NextResponse.json(
-        { error: "Wrong code. In demo mode, enter 482913." },
+        {
+          error: verifyRes.error || "Wrong code. In demo mode, enter 482913.",
+          isLocked: verifyRes.isLocked,
+          attemptsRemaining: verifyRes.attemptsRemaining,
+        },
         { status: 401 }
       );
     }
-
-    const cleanPhone = phone.replace(/[^\d+]/g, "");
 
     let parent: any = null;
     let linkedStudentIds: string[] = [];
@@ -59,7 +70,7 @@ export async function POST(req: Request) {
           hasConsent: consentedStudentIds.includes(ps.student.id),
         }));
       }
-    } catch (dbError) {
+    } catch {
       // In demo mode or offline, fallback to in-memory demo data
       const demo = findDemoParentByPhone(cleanPhone);
       if (demo) {
