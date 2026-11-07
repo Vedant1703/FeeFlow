@@ -5,6 +5,7 @@ import Link from "next/link";
 import { DemoBar } from "@/components/shared/DemoBar";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
 import { LanguageToggle, useLanguage } from "@/components/shared/LanguageToggle";
+import { ParentBottomNav } from "@/components/parent/ParentBottomNav";
 import { ArrowLeft, FileText, ShieldCheck, HelpCircle, CheckCircle } from "lucide-react";
 
 export default function PublicRefundPolicyPage() {
@@ -14,7 +15,7 @@ export default function PublicRefundPolicyPage() {
     <div className="min-h-screen bg-paper flex flex-col items-center">
       <DemoBar />
 
-      <main className="w-full max-w-[480px] px-4 py-8 flex-1 flex flex-col space-y-6">
+      <main className="w-full max-w-[480px] px-4 py-8 flex-1 flex flex-col space-y-6 pb-28">
         <div className="flex items-center justify-between pb-3 border-b border-line">
           <Link
             href="/parent"
@@ -93,6 +94,8 @@ export default function PublicRefundPolicyPage() {
           </div>
         </div>
       </main>
+
+      <ParentBottomNav activeTab="POLICY" />
     </div>
   );
 }

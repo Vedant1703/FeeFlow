@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { StatusChip } from "@/components/shared/StatusChip";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
@@ -27,6 +27,20 @@ export default function ReconciliationPage() {
   const [isMonthClosed, setIsMonthClosed] = useState(false);
   const [isCloseModalOpen, setIsCloseModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Accessible Modal: Escape key listener and body scroll lock
+  useEffect(() => {
+    if (!isCloseModalOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsCloseModalOpen(false);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "unset";
+    };
+  }, [isCloseModalOpen]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -309,11 +323,16 @@ export default function ReconciliationPage() {
 
         {/* Confirmation Modal for Month Close */}
         {isCloseModalOpen && (
-          <div className="fixed inset-0 bg-ink/50 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="close-modal-title"
+            className="fixed inset-0 bg-ink/50 backdrop-blur-xs flex items-center justify-center z-50 p-4"
+          >
             <div className="bg-surface rounded-xl border border-line max-w-md w-full p-6 shadow-xl space-y-4">
               <div className="flex items-start justify-between">
                 <div>
-                  <h3 className="text-base font-bold text-ink">Confirm Month-End Close</h3>
+                  <h3 id="close-modal-title" className="text-base font-bold text-ink">Confirm Month-End Close</h3>
                   <p className="text-xs text-ink-3 mt-0.5">
                     Sealing October 2026 financials. This operation creates an immutable cryptographic snapshot.
                   </p>

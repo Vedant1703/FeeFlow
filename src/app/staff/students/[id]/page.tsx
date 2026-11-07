@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { StaffNav } from "@/components/shared/StaffNav";
@@ -35,6 +35,23 @@ export default function StudentFeeLedgerPage() {
   const [pauseSuccess, setPauseSuccess] = useState(false);
   const [pauseDays, setPauseDays] = useState("7");
   const [withdrawalNotes, setWithdrawalNotes] = useState("Student relocating to Kota");
+
+  // Accessible Modals: Escape key listener and body scroll lock
+  useEffect(() => {
+    if (!isPauseModalOpen && !isWithdrawalModalOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsPauseModalOpen(false);
+        setIsWithdrawalModalOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "unset";
+    };
+  }, [isPauseModalOpen, isWithdrawalModalOpen]);
 
   // Synthetic student data for Ishita Sharma STU-0587
   const student = {

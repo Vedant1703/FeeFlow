@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { StatusChip } from "@/components/shared/StatusChip";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
@@ -168,6 +168,20 @@ export default function ReminderCentrePage() {
   const [isPauseDialogOpen, setIsPauseDialogOpen] = useState(false);
   const [pauseReason, setPauseReason] = useState("");
   const [pauseUntil, setPauseUntil] = useState("2026-11-30");
+
+  // Accessible Modal: Escape key listener and body scroll lock
+  useEffect(() => {
+    if (!isPauseDialogOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsPauseDialogOpen(false);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "unset";
+    };
+  }, [isPauseDialogOpen]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -572,11 +586,16 @@ export default function ReminderCentrePage() {
 
         {/* Pause Dialog Modal */}
         {isPauseDialogOpen && (
-          <div className="fixed inset-0 bg-ink/50 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pause-dialog-title"
+            className="fixed inset-0 bg-ink/50 backdrop-blur-xs flex items-center justify-center z-50 p-4"
+          >
             <div className="bg-surface rounded-xl border border-line max-w-md w-full p-6 shadow-xl space-y-4">
               <div className="flex items-start justify-between">
                 <div>
-                  <h3 className="text-base font-bold text-ink">Pause Reminders</h3>
+                  <h3 id="pause-dialog-title" className="text-base font-bold text-ink">Pause Reminders</h3>
                   <p className="text-xs text-ink-3 mt-0.5">
                     Temporarily suppress automated reminder dispatches for {selectedReminder.studentName}.
                   </p>

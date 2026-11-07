@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { DemoBar } from "@/components/shared/DemoBar";
@@ -27,6 +27,20 @@ export default function StaffPaymentsPage() {
   const [allocationReason, setAllocationReason] = useState("Direct NEFT transfer verified against student ID 0219");
   const [isAllocating, setIsAllocating] = useState(false);
   const [allocationSuccess, setAllocationSuccess] = useState(false);
+
+  // Accessible Modal: Escape key listener and body scroll lock
+  useEffect(() => {
+    if (!selectedUnmatched) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelectedUnmatched(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "unset";
+    };
+  }, [selectedUnmatched]);
 
   // Unmatched payments queue fixture
   const unmatchedPayments = [

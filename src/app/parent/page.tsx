@@ -8,6 +8,7 @@ import { LanguageToggle, useLanguage } from "@/components/shared/LanguageToggle"
 import { Rail, RailSegment } from "@/components/shared/Rail";
 import { StatusChip } from "@/components/shared/StatusChip";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
+import { ParentBottomNav } from "@/components/parent/ParentBottomNav";
 import { formatINR } from "@/domain/money";
 import {
   ChevronDown,
@@ -40,6 +41,34 @@ export default function ParentHomePage() {
   const [customAmountRupees, setCustomAmountRupees] = useState("5000");
   const [isCreatingIntent, setIsCreatingIntent] = useState(false);
   const [activeTab, setActiveTab] = useState<"FEES" | "RECEIPTS" | "ATTENDANCE" | "TESTS">("FEES");
+
+  // Sync tab from URL query param if present
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get("tab");
+      if (tabParam === "RECEIPTS") setActiveTab("RECEIPTS");
+      else if (tabParam === "ATTENDANCE") setActiveTab("ATTENDANCE");
+      else if (tabParam === "TESTS") setActiveTab("TESTS");
+      else if (tabParam === "FEES") setActiveTab("FEES");
+    }
+  }, []);
+
+  // Modal accessibility: Escape key listener and body scroll lock
+  useEffect(() => {
+    if (!isPaySheetOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsPaySheetOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = "unset";
+    };
+  }, [isPaySheetOpen]);
 
   // Child data fixtures
   const isIshita = selectedChild === "ISHITA";
@@ -185,7 +214,7 @@ export default function ParentHomePage() {
     <div className="min-h-screen bg-paper flex flex-col items-center">
       <DemoBar />
 
-      <main className="w-full max-w-[420px] px-4 py-5 flex-1 flex flex-col space-y-5 pb-16">
+      <main className="w-full max-w-[420px] px-4 py-5 flex-1 flex flex-col space-y-5 pb-28">
         {/* =========================================================================
             PARENT 5-SECOND CLARITY SECTION (ABOVE 640px FOLD)
             1. Top Row: App Title, Child Switcher, Language Toggle
@@ -973,6 +1002,9 @@ export default function ParentHomePage() {
           </div>
         </div>
       )}
+
+      {/* Persistent Parent Mobile Bottom Navigation (Phase 3) */}
+      <ParentBottomNav activeTab={activeTab} onTabChange={setActiveTab} />
     </div>
   );
 }
