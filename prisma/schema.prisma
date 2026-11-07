@@ -647,17 +647,20 @@ model AuditLog {
 }
 
 model OtpToken {
-  id          String   @id @default(cuid())
-  phone       String   // Normalized E.164 phone (+91...)
-  tokenHash   String   // SHA-256 HMAC hash of the 6-digit OTP
-  expiresAt   DateTime
-  attempts    Int      @default(0)
-  maxAttempts Int      @default(3)
-  consumed    Boolean  @default(false)
-  createdAt   DateTime @default(now())
+  id                String   @id @default(cuid())
+  phone             String   // Normalized E.164 phone (+91...)
+  tokenHash         String   // SHA-256 HMAC hash of the 6-digit OTP or accessToken digest
+  provider          String   @default("INTERNAL") // "INTERNAL" | "MSG91_WIDGET"
+  providerRequestId String?  @unique // MSG91 reqId binding
+  expiresAt         DateTime
+  attempts          Int      @default(0)
+  maxAttempts       Int      @default(3)
+  consumed          Boolean  @default(false)
+  createdAt         DateTime @default(now())
 
   @@index([phone, expiresAt])
   @@index([phone, consumed])
+  @@index([providerRequestId])
 }
 
 model Account {

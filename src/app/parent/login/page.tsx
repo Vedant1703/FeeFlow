@@ -20,6 +20,29 @@ import {
   GraduationCap,
 } from "lucide-react";
 
+declare global {
+  interface Window {
+    initSendOTP?: (config: any) => void;
+    sendOtp?: (
+      identifier: string | any,
+      success?: (data: any) => void,
+      failure?: (err: any) => void
+    ) => any;
+    retryOtp?: (
+      channel: any,
+      success?: (data: any) => void,
+      failure?: (err: any) => void,
+      reqId?: string
+    ) => any;
+    verifyOtp?: (
+      otp: string | any,
+      success?: (data: any) => void,
+      failure?: (err: any) => void,
+      reqId?: string
+    ) => any;
+  }
+}
+
 function ParentLoginContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -44,7 +67,16 @@ function ParentLoginContent() {
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  // Incoming SMS simulation state
+  // MSG91 Widget Challenge State
+  const [challengeId, setChallengeId] = useState<string | null>(null);
+  const [reqId, setReqId] = useState<string | null>(null);
+  const [widgetStatus, setWidgetStatus] = useState<"disabled" | "loading" | "ready" | "failed">("loading");
+
+  const widgetId = process.env.NEXT_PUBLIC_MSG91_WIDGET_ID;
+  const widgetToken = process.env.NEXT_PUBLIC_MSG91_WIDGET_TOKEN;
+  const isWidgetConfigured = Boolean(widgetId && widgetToken);
+
+  // Incoming SMS simulation state (used for Mock / Demo mode)
   const [receivedSms, setReceivedSms] = useState<{
     code: string;
     sender: string;
@@ -54,6 +86,57 @@ function ParentLoginContent() {
 
   // 60-second Resend Cooldown Timer
   const [cooldown, setCooldown] = useState(0);
+
+  // Safely initialize the MSG91 Web SDK when credentials are configured
+  useEffect(() => {
+    if (!isWidgetConfigured) {
+      setWidgetStatus("disabled");
+      return;
+    }
+
+    if (typeof window !== "undefined" && window.initSendOTP) {
+      setWidgetStatus("ready");
+      return;
+    }
+
+    const scriptId = "msg91-otp-provider-script";
+    let script = document.getElementById(scriptId) as HTMLScriptElement | null;
+
+    if (!script) {
+      script = document.createElement("script");
+      script.id = scriptId;
+      script.src = "https://verify.msg91.com/otp-provider.js";
+      script.async = true;
+
+      script.onload = () => {
+        try {
+          if (window.initSendOTP) {
+            const configuration = {
+              widgetId,
+              tokenAuth: widgetToken,
+              exposeMethods: true,
+              success: () => {},
+              failure: () => {},
+            };
+            window.initSendOTP(configuration);
+            setWidgetStatus("ready");
+          } else {
+            setWidgetStatus("failed");
+          }
+        } catch {
+          setWidgetStatus("failed");
+        }
+      };
+
+      script.onerror = () => {
+        setWidgetStatus("failed");
+      };
+
+      document.body.appendChild(script);
+    } else {
+      setWidgetStatus("ready");
+    }
+  }, [isWidgetConfigured, widgetId, widgetToken]);
 
   useEffect(() => {
     const errorParam = searchParams.get("error");
@@ -78,32 +161,111 @@ function ParentLoginContent() {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/otp/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        if (data.notRegistered) {
-          setError(`${data.error} You can switch to the Register tab above to create an account.`);
-          return;
+      if (isWidgetConfigured) {
+        if (widgetStatus === "failed") {
+          throw new Error("MSG91 OTP Widget failed to load. Please verify your network connection or credentials.");
         }
-        throw new Error(data.error || "Failed to send OTP");
+
+        // 1. FeeFlow backend validates phone, intent, and enforces 60s cooldown & 3/10m rate limits
+        const chalRes = await fetch("/api/auth/otp/challenge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone }),
+        });
+
+        const chalData = await chalRes.json();
+        if (!chalRes.ok) {
+          if (chalData.notRegistered) {
+            setError(`${chalData.error} You can switch to the Register tab above to create an account.`);
+            return;
+          }
+          throw new Error(chalData.error || "Failed to initiate OTP challenge");
+        }
+
+        const activeChallengeId = chalData.challengeId;
+        const widgetPhone = chalData.widgetPhone; // Country code without '+' (e.g. 919829012345)
+        setChallengeId(activeChallengeId);
+
+        // 2. Trigger MSG91 sendOtp via Custom UI exposed method
+        await new Promise<void>((resolve, reject) => {
+          if (!window.sendOtp) {
+            return reject(new Error("MSG91 sendOtp method is not available on window."));
+          }
+
+          window.sendOtp(
+            widgetPhone,
+            async (successData: any) => {
+              try {
+                // Extract provider request ID
+                const extractedReqId =
+                  successData?.reqId ||
+                  successData?.request_id ||
+                  successData?.message ||
+                  (typeof successData === "string" ? successData : "");
+
+                if (!extractedReqId) {
+                  return reject(new Error("MSG91 did not return a valid provider request ID (reqId)."));
+                }
+
+                // 3. Register reqId against FeeFlow challenge
+                const regRes = await fetch("/api/auth/otp/register-reqid", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    challengeId: activeChallengeId,
+                    reqId: extractedReqId,
+                  }),
+                });
+
+                const regData = await regRes.json();
+                if (!regRes.ok) {
+                  return reject(new Error(regData.error || "Failed to register provider request ID with FeeFlow"));
+                }
+
+                setReqId(extractedReqId);
+                setCooldown(chalData.resendAfterSeconds || 60);
+                setStep("OTP");
+                setSuccessMsg("OTP code sent to your mobile via SMS. Please enter the code.");
+                resolve();
+              } catch (innerErr: any) {
+                reject(innerErr);
+              }
+            },
+            (failureData: any) => {
+              const msg = failureData?.message || failureData?.error || "Failed to send OTP via MSG91";
+              reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+            }
+          );
+        });
+      } else {
+        // Fallback to Mock OTP flow (for local tests / demo)
+        const res = await fetch("/api/auth/otp/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          if (data.notRegistered) {
+            setError(`${data.error} You can switch to the Register tab above to create an account.`);
+            return;
+          }
+          throw new Error(data.error || "Failed to send OTP");
+        }
+
+        const generatedCode = data.code || data.demoCode || "482913";
+
+        setReceivedSms({
+          code: generatedCode,
+          sender: "VK-FEEFLO (Jaipur Hub)",
+          timestamp: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          message: `Your FeeFlow verification code is ${generatedCode}. Valid for 5 minutes. Do not share with anyone.`,
+        });
+
+        setCooldown(data.resendAfterSeconds || 60);
+        setStep("OTP");
       }
-
-      const generatedCode = data.code || data.demoCode || "482913";
-
-      setReceivedSms({
-        code: generatedCode,
-        sender: "VK-FEEFLO (Jaipur Hub)",
-        timestamp: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-        message: `Your FeeFlow verification code is ${generatedCode}. Valid for 5 minutes. Do not share with anyone.`,
-      });
-
-      setCooldown(data.resendAfterSeconds || 60);
-      setStep("OTP");
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -137,18 +299,85 @@ function ParentLoginContent() {
         throw new Error(data.error || "Registration failed");
       }
 
-      const generatedCode = data.code || data.demoCode || "482913";
+      if (isWidgetConfigured) {
+        // Create challenge for newly registered parent
+        const chalRes = await fetch("/api/auth/otp/challenge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone, allowUnregistered: true }),
+        });
 
-      setReceivedSms({
-        code: generatedCode,
-        sender: "VK-FEEFLO (Registration)",
-        timestamp: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-        message: `Welcome to FeeFlow! Your registration verification code is ${generatedCode}. Valid for 5 minutes.`,
-      });
+        const chalData = await chalRes.json();
+        if (!chalRes.ok) {
+          throw new Error(chalData.error || "Account created, but failed to initiate OTP challenge.");
+        }
 
-      setSuccessMsg(data.message || "Registration successful! OTP sent.");
-      setCooldown(data.resendAfterSeconds || 60);
-      setStep("OTP");
+        const activeChallengeId = chalData.challengeId;
+        const widgetPhone = chalData.widgetPhone;
+        setChallengeId(activeChallengeId);
+
+        await new Promise<void>((resolve, reject) => {
+          if (!window.sendOtp) {
+            return reject(new Error("MSG91 sendOtp method is not available on window."));
+          }
+
+          window.sendOtp(
+            widgetPhone,
+            async (successData: any) => {
+              try {
+                const extractedReqId =
+                  successData?.reqId ||
+                  successData?.request_id ||
+                  successData?.message ||
+                  (typeof successData === "string" ? successData : "");
+
+                if (!extractedReqId) {
+                  return reject(new Error("MSG91 did not return a valid provider request ID (reqId)."));
+                }
+
+                const regRes = await fetch("/api/auth/otp/register-reqid", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    challengeId: activeChallengeId,
+                    reqId: extractedReqId,
+                  }),
+                });
+
+                const regData = await regRes.json();
+                if (!regRes.ok) {
+                  return reject(new Error(regData.error || "Failed to register provider request ID"));
+                }
+
+                setReqId(extractedReqId);
+                setSuccessMsg("Account created! Verification OTP sent via SMS.");
+                setCooldown(chalData.resendAfterSeconds || 60);
+                setStep("OTP");
+                resolve();
+              } catch (innerErr: any) {
+                reject(innerErr);
+              }
+            },
+            (failureData: any) => {
+              const msg = failureData?.message || failureData?.error || "Failed to send OTP via MSG91";
+              reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+            }
+          );
+        });
+      } else {
+        const generatedCode = data.code || data.demoCode || "482913";
+
+        setReceivedSms({
+          code: generatedCode,
+          sender: "VK-FEEFLO (Registration)",
+          timestamp: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          message: `Welcome to FeeFlow! Your registration verification code is ${generatedCode}. Valid for 5 minutes.`,
+        });
+
+        setSuccessMsg(data.message || "Registration successful! OTP sent.");
+        setCooldown(data.resendAfterSeconds || 60);
+        setStep("OTP");
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -163,26 +392,112 @@ function ParentLoginContent() {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/otp/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone, code: otp }),
-      });
+      if (isWidgetConfigured && challengeId && reqId) {
+        // MSG91 Web SDK Custom UI verify flow
+        await new Promise<void>((resolve, reject) => {
+          if (!window.verifyOtp) {
+            return reject(new Error("MSG91 verifyOtp method not available on window."));
+          }
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Invalid OTP code");
-      }
+          window.verifyOtp(
+            otp.trim(),
+            async (verifyData: any) => {
+              try {
+                const accessToken =
+                  typeof verifyData === "string"
+                    ? verifyData
+                    : verifyData?.["access-token"] ||
+                      verifyData?.accessToken ||
+                      verifyData?.token ||
+                      verifyData?.message;
 
-      if (data.requiresConsent) {
-        router.push("/parent/consent");
+                if (!accessToken || typeof accessToken !== "string") {
+                  return reject(new Error("MSG91 verification did not return an access token."));
+                }
+
+                // Call FeeFlow backend to verify directly with MSG91 verifyAccessToken API
+                const res = await fetch("/api/auth/otp/verify-widget", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    challengeId,
+                    reqId,
+                    accessToken,
+                  }),
+                });
+
+                const data = await res.json();
+                if (!res.ok) {
+                  return reject(new Error(data.error || "Failed to verify access token with server"));
+                }
+
+                if (data.requiresConsent) {
+                  router.push("/parent/consent");
+                } else {
+                  router.push("/parent");
+                }
+                resolve();
+              } catch (innerErr: any) {
+                reject(innerErr);
+              }
+            },
+            (failureData: any) => {
+              const msg = failureData?.message || failureData?.error || "Invalid OTP code entered.";
+              reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+            },
+            reqId
+          );
+        });
       } else {
-        router.push("/parent");
+        // Mock OTP verification
+        const res = await fetch("/api/auth/otp/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone, code: otp }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Invalid OTP code");
+        }
+
+        if (data.requiresConsent) {
+          router.push("/parent/consent");
+        } else {
+          router.push("/parent");
+        }
       }
     } catch (err: any) {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Handle Resend OTP
+  const handleResendOtp = async () => {
+    if (cooldown > 0) return;
+    setError(null);
+    setSuccessMsg(null);
+
+    if (isWidgetConfigured && reqId && window.retryOtp) {
+      setLoading(true);
+      window.retryOtp(
+        "11", // SMS channel
+        () => {
+          setLoading(false);
+          setCooldown(60);
+          setSuccessMsg("OTP resent via SMS.");
+        },
+        (failureData: any) => {
+          setLoading(false);
+          const msg = failureData?.message || failureData?.error || "Failed to resend OTP via MSG91";
+          setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+        },
+        reqId
+      );
+    } else {
+      await handleSendOtp();
     }
   };
 
@@ -209,6 +524,23 @@ function ParentLoginContent() {
           </div>
           <LanguageToggle />
         </div>
+
+        {/* Mode Indicator: MSG91 Widget vs Mock Mode */}
+        <div className="mb-4 flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded bg-surface border border-line">
+          <span className="text-ink-3">Auth Mode:</span>
+          {isWidgetConfigured ? (
+            <span className="inline-flex items-center gap-1.5 font-semibold text-teal">
+              <span className="w-1.5 h-1.5 rounded-full bg-teal animate-pulse"></span>
+              MSG91 OTP Widget ({widgetStatus === "ready" ? "SDK Ready" : widgetStatus})
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 font-semibold text-ink-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-ink-3"></span>
+              Mock Provider (Deterministic Demo)
+            </span>
+          )}
+        </div>
+        <div id="msg91-captcha-container"></div>
 
         {error && (
           <div className="mb-4 p-3 rounded-panel bg-bad-t border border-bad/30 text-bad text-xs flex items-start gap-2 animate-in fade-in">
@@ -621,7 +953,7 @@ function ParentLoginContent() {
               ) : (
                 <button
                   type="button"
-                  onClick={() => handleSendOtp()}
+                  onClick={() => handleResendOtp()}
                   disabled={loading}
                   className="text-xs font-semibold text-teal hover:underline inline-flex items-center gap-1"
                 >

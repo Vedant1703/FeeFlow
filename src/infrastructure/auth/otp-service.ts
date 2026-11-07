@@ -7,6 +7,7 @@
 import crypto from "crypto";
 import { prisma } from "@/infrastructure/db/prisma";
 import { getSmsProvider } from "./sms/sms-provider";
+import { msg91WidgetAdapter, Msg91WidgetAdapter } from "./sms/msg91-widget-adapter";
 
 export const OTP_HMAC_SECRET =
   process.env.OTP_HMAC_SECRET ||
@@ -15,6 +16,8 @@ export const OTP_HMAC_SECRET =
 
 export const OTP_EXPIRY_MINUTES = 5;
 export const OTP_EXPIRY_MS = OTP_EXPIRY_MINUTES * 60 * 1000;
+export const WIDGET_CHALLENGE_EXPIRY_MINUTES = 15;
+export const WIDGET_CHALLENGE_EXPIRY_MS = WIDGET_CHALLENGE_EXPIRY_MINUTES * 60 * 1000; // 15-minute widget expiry
 export const RESEND_COOLDOWN_SECONDS = 60;
 export const RESEND_COOLDOWN_MS = RESEND_COOLDOWN_SECONDS * 1000;
 export const MAX_ATTEMPTS = 3;
@@ -84,8 +87,11 @@ export function hashOtp(phone: string, otp: string, secret: string = OTP_HMAC_SE
 }
 
 export interface InMemoryOtpRecord {
+  id?: string;
   phone: string;
   tokenHash: string;
+  provider?: string; // "INTERNAL" | "MSG91_WIDGET"
+  providerRequestId?: string;
   expiresAt: Date;
   attempts: number;
   maxAttempts: number;
@@ -398,6 +404,395 @@ export class OtpService {
     return {
       success: true,
       normalizedPhone: phone,
+    };
+  }
+
+  /**
+   * Helper to find challenge record across in-memory tokens.
+   */
+  private findInMemoryChallenge(challengeId: string): InMemoryOtpRecord | undefined {
+    for (const tokens of this.inMemoryTokens.values()) {
+      const match = tokens.find((t) => t.id === challengeId);
+      if (match) return match;
+    }
+    return undefined;
+  }
+
+  /**
+   * Creates a short-lived (15-minute) MSG91 Widget challenge bound to the phone number.
+   * Enforces 60-second cooldown and max 3 requests per 10-minute sliding window.
+   */
+  async createWidgetChallenge(
+    rawPhone: string,
+    options: { now?: Date; ipAddress?: string } = {}
+  ): Promise<{
+    success: boolean;
+    challengeId?: string;
+    normalizedPhone?: string;
+    widgetPhone?: string;
+    resendAfterSeconds: number;
+    expiresInSeconds?: number;
+    error?: string;
+  }> {
+    const norm = normalizeIndianPhoneNumber(rawPhone);
+    if (!norm.isValid) {
+      return {
+        success: false,
+        resendAfterSeconds: 0,
+        error: norm.error,
+      };
+    }
+
+    const phone = norm.normalized;
+    const now = options.now ? options.now.getTime() : Date.now();
+
+    // 1. Sliding window rate limit (max 3 per 10 min)
+    const rateCheck = this.checkRateLimit(phone, now);
+    if (!rateCheck.allowed) {
+      return {
+        success: false,
+        resendAfterSeconds: rateCheck.waitSeconds || 60,
+        error: `Too many OTP requests. Please wait ${rateCheck.waitSeconds} seconds before trying again.`,
+      };
+    }
+
+    // 2. 60-second resend cooldown
+    const cooldownCheck = this.checkCooldown(phone, now);
+    if (!cooldownCheck.allowed) {
+      return {
+        success: false,
+        resendAfterSeconds: cooldownCheck.waitSeconds || 60,
+        error: `Please wait ${cooldownCheck.waitSeconds} seconds before requesting a new OTP.`,
+      };
+    }
+
+    const challengeId = `ch_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
+    const initialTokenHash = crypto
+      .createHash("sha256")
+      .update(`${challengeId}:${phone}:${now}`)
+      .digest("hex");
+    const expiresAt = new Date(now + WIDGET_CHALLENGE_EXPIRY_MS);
+    const createdAt = new Date(now);
+
+    const record: InMemoryOtpRecord = {
+      id: challengeId,
+      phone,
+      tokenHash: initialTokenHash,
+      provider: "MSG91_WIDGET",
+      expiresAt,
+      attempts: 0,
+      maxAttempts: MAX_ATTEMPTS,
+      consumed: false,
+      createdAt,
+    };
+
+    // Store in-memory
+    const existing = this.inMemoryTokens.get(phone) || [];
+    existing.push(record);
+    this.inMemoryTokens.set(phone, existing);
+
+    // Record rate limit timestamp
+    const rateRec = this.phoneRateLimits.get(phone) || { timestamps: [] };
+    rateRec.timestamps.push(now);
+    this.phoneRateLimits.set(phone, rateRec);
+
+    // Persist to Prisma
+    try {
+      await prisma.otpToken.create({
+        data: {
+          id: challengeId,
+          phone,
+          tokenHash: initialTokenHash,
+          provider: "MSG91_WIDGET",
+          expiresAt,
+          attempts: 0,
+          maxAttempts: MAX_ATTEMPTS,
+          consumed: false,
+        },
+      });
+    } catch {
+      // In-memory fallback handles offline testing & demo mode gracefully
+    }
+
+    // MSG91 widget identifier requires country code without leading '+' (e.g. 919829012345)
+    const widgetPhone = phone.replace(/^\+/, "");
+
+    return {
+      success: true,
+      challengeId,
+      normalizedPhone: phone,
+      widgetPhone,
+      resendAfterSeconds: RESEND_COOLDOWN_SECONDS,
+      expiresInSeconds: WIDGET_CHALLENGE_EXPIRY_MINUTES * 60,
+    };
+  }
+
+  /**
+   * Binds the MSG91 provider reqId (received from window.sendOtp) to the existing FeeFlow challenge.
+   */
+  async registerProviderRequestId(
+    challengeId: string,
+    reqId: string,
+    options: { now?: Date } = {}
+  ): Promise<{
+    success: boolean;
+    challengeId?: string;
+    reqId?: string;
+    error?: string;
+  }> {
+    if (!challengeId || typeof challengeId !== "string" || !challengeId.trim()) {
+      return { success: false, error: "Challenge ID is required" };
+    }
+    if (!reqId || typeof reqId !== "string" || !reqId.trim()) {
+      return { success: false, error: "Provider request ID (reqId) is required" };
+    }
+
+    const cleanChallengeId = challengeId.trim();
+    const cleanReqId = reqId.trim();
+    const now = options.now ? options.now.getTime() : Date.now();
+
+    // 1. Check database first
+    let dbToken: any = null;
+    try {
+      dbToken = await prisma.otpToken.findUnique({
+        where: { id: cleanChallengeId },
+      });
+    } catch {}
+
+    const memToken = this.findInMemoryChallenge(cleanChallengeId);
+    const active = dbToken || memToken;
+
+    if (!active) {
+      return { success: false, error: "Challenge not found. Please request a new OTP." };
+    }
+
+    if (active.consumed) {
+      return { success: false, error: "Challenge has already been consumed. Replay detected." };
+    }
+
+    const expiresAtMs =
+      active.expiresAt instanceof Date
+        ? active.expiresAt.getTime()
+        : new Date(active.expiresAt).getTime();
+
+    if (now > expiresAtMs) {
+      return { success: false, error: "Challenge has expired. Please request a new OTP." };
+    }
+
+    // Idempotent check
+    if (active.providerRequestId && active.providerRequestId === cleanReqId) {
+      return { success: true, challengeId: cleanChallengeId, reqId: cleanReqId };
+    }
+
+    if (active.providerRequestId && active.providerRequestId !== cleanReqId) {
+      return { success: false, error: "Challenge is already bound to a different provider request ID." };
+    }
+
+    // Ensure reqId is unique across active challenges (prevent duplicate/replayed reqId)
+    if (memToken) {
+      for (const list of this.inMemoryTokens.values()) {
+        const conflict = list.find((t) => t.id !== cleanChallengeId && t.providerRequestId === cleanReqId);
+        if (conflict) {
+          return { success: false, error: "Provider request ID has already been registered with another challenge." };
+        }
+      }
+      memToken.providerRequestId = cleanReqId;
+    }
+
+    if (dbToken) {
+      try {
+        const existingReq = await prisma.otpToken.findFirst({
+          where: {
+            providerRequestId: cleanReqId,
+            NOT: { id: cleanChallengeId },
+          },
+        });
+        if (existingReq) {
+          return { success: false, error: "Provider request ID has already been registered with another challenge." };
+        }
+
+        await prisma.otpToken.update({
+          where: { id: cleanChallengeId },
+          data: { providerRequestId: cleanReqId },
+        });
+      } catch (err: any) {
+        if (err?.code === "P2002") {
+          return { success: false, error: "Provider request ID has already been registered." };
+        }
+      }
+    }
+
+    return {
+      success: true,
+      challengeId: cleanChallengeId,
+      reqId: cleanReqId,
+    };
+  }
+
+  /**
+   * Verifies an access token issued by the MSG91 Web SDK against the challenge and provider.
+   */
+  async verifyWidgetAccessToken(params: {
+    challengeId: string;
+    reqId: string;
+    accessToken: string;
+    now?: Date;
+    adapter?: Msg91WidgetAdapter;
+  }): Promise<{
+    success: boolean;
+    normalizedPhone?: string;
+    challengeId?: string;
+    error?: string;
+    attemptsRemaining?: number;
+    isLocked?: boolean;
+  }> {
+    const { challengeId, reqId, accessToken, now: optNow, adapter = msg91WidgetAdapter } = params;
+
+    if (!challengeId || typeof challengeId !== "string" || !challengeId.trim()) {
+      return { success: false, error: "Challenge ID is required." };
+    }
+    if (!reqId || typeof reqId !== "string" || !reqId.trim()) {
+      return { success: false, error: "Provider request ID (reqId) is required." };
+    }
+    if (!accessToken || typeof accessToken !== "string" || !accessToken.trim()) {
+      return { success: false, error: "MSG91 access token is required." };
+    }
+
+    const cleanChallengeId = challengeId.trim();
+    const cleanReqId = reqId.trim();
+    const cleanAccessToken = accessToken.trim();
+    const now = optNow ? optNow.getTime() : Date.now();
+
+    // 1. Fetch challenge
+    let dbToken: any = null;
+    try {
+      dbToken = await prisma.otpToken.findUnique({
+        where: { id: cleanChallengeId },
+      });
+    } catch {}
+
+    const memToken = this.findInMemoryChallenge(cleanChallengeId);
+    const active = dbToken || memToken;
+
+    if (!active) {
+      return { success: false, error: "Challenge not found. Please request a new OTP." };
+    }
+
+    // 2. Check consumption (replay prevention)
+    if (active.consumed) {
+      return { success: false, error: "Challenge has already been consumed. Replay detected." };
+    }
+
+    // 3. Check expiry
+    const expiresAtMs =
+      active.expiresAt instanceof Date
+        ? active.expiresAt.getTime()
+        : new Date(active.expiresAt).getTime();
+
+    if (now > expiresAtMs) {
+      return { success: false, error: "Challenge has expired. Please request a new OTP." };
+    }
+
+    // 4. Check attempt lockout
+    if (active.attempts >= active.maxAttempts) {
+      return {
+        success: false,
+        isLocked: true,
+        attemptsRemaining: 0,
+        error: "Maximum verification attempts exceeded. Challenge locked.",
+      };
+    }
+
+    // Helper for recording a failed verification attempt
+    const recordFailedAttempt = async (errorMessage: string) => {
+      active.attempts += 1;
+      if (memToken && memToken !== active) {
+        memToken.attempts += 1;
+      }
+      if (dbToken) {
+        try {
+          await prisma.otpToken.update({
+            where: { id: cleanChallengeId },
+            data: { attempts: { increment: 1 } },
+          });
+        } catch {}
+      }
+      const attemptsRemaining = Math.max(0, active.maxAttempts - active.attempts);
+      const isLocked = attemptsRemaining === 0;
+      return {
+        success: false,
+        isLocked,
+        attemptsRemaining,
+        error: isLocked
+          ? "Maximum verification attempts exceeded. Challenge locked."
+          : errorMessage,
+      };
+    };
+
+    // 5. Verify provider reqId matches registered reqId
+    if (!active.providerRequestId || active.providerRequestId !== cleanReqId) {
+      return recordFailedAttempt("Provider request ID mismatch with challenge.");
+    }
+
+    // 6. Check access token replay (using token hash)
+    const tokenHash = crypto.createHash("sha256").update(cleanAccessToken).digest("hex");
+
+    // Check if tokenHash was already consumed in memory
+    for (const tokens of this.inMemoryTokens.values()) {
+      if (tokens.some((t) => t.tokenHash === tokenHash && t.consumed)) {
+        return { success: false, error: "Access token has already been consumed. Replay detected." };
+      }
+    }
+
+    // Check if tokenHash was already consumed in DB
+    if (dbToken) {
+      try {
+        const replayed = await prisma.otpToken.findFirst({
+          where: { tokenHash, consumed: true },
+        });
+        if (replayed) {
+          return { success: false, error: "Access token has already been consumed. Replay detected." };
+        }
+      } catch {}
+    }
+
+    // 7. Verify access token with MSG91 API
+    const verifyResult = await adapter.verifyAccessToken(cleanAccessToken);
+    if (!verifyResult.success || !verifyResult.verifiedIdentifier) {
+      return recordFailedAttempt(
+        verifyResult.error || "MSG91 server rejected access token"
+      );
+    }
+
+    // 8. Identity match check: verified mobile MUST match the challenge phone
+    if (verifyResult.verifiedIdentifier !== active.phone) {
+      return recordFailedAttempt(
+        `Phone identity mismatch. Verified mobile ${verifyResult.verifiedIdentifier} does not match expected ${active.phone}.`
+      );
+    }
+
+    // 9. Success: Atomically mark challenge consumed and store accessToken digest
+    if (memToken) {
+      memToken.consumed = true;
+      memToken.tokenHash = tokenHash;
+    }
+
+    if (dbToken) {
+      try {
+        await prisma.otpToken.update({
+          where: { id: cleanChallengeId },
+          data: {
+            consumed: true,
+            tokenHash,
+          },
+        });
+      } catch {}
+    }
+
+    return {
+      success: true,
+      normalizedPhone: active.phone,
+      challengeId: cleanChallengeId,
     };
   }
 }
