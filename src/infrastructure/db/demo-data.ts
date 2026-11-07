@@ -133,3 +133,4 @@ export function findDemoUserByEmail(email: string): DemoStaffUser | null {
   const normalized = email.toLowerCase().trim();
   return DEMO_STAFF_USERS.find((u) => u.email.toLowerCase() === normalized) || null;
 }
+

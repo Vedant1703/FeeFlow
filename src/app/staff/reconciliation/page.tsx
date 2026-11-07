@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { StatusChip } from "@/components/shared/StatusChip";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
+import { buildCsvDocument } from "@/lib/csv-sanitizer";
 import {
   Scale,
   CheckCircle2,
@@ -44,29 +45,41 @@ export default function ReconciliationPage() {
   const isBalanced = netReceivedPaise === totalAppliedPaise;
 
   const handleDownloadTallyCsv = () => {
-    const csvRows = [
-      "VoucherDate,VoucherType,VoucherNo,LedgerName,Debit,Credit,Narration",
-      "2026-10-10,Receipt,RCP-2026-10-0412,HDFC Bank Current A/c,30000.00,0.00,Tuition fee STU-0412 Aarav Meena",
-      "2026-10-10,Receipt,RCP-2026-10-0412,Course Fee Income - JEE,0.00,25423.73,Instalment 1 fee income",
-      "2026-10-10,Receipt,RCP-2026-10-0412,Output CGST 9%,0.00,2288.14,CGST @ 9% on SAC 999293",
-      "2026-10-10,Receipt,RCP-2026-10-0412,Output SGST 9%,0.00,2288.14,SGST @ 9% on SAC 999293",
-      "2026-10-10,Receipt,RCP-2026-10-0587,HDFC Bank Current A/c,15000.00,0.00,Part fee STU-0587 Ishita Sharma",
-      "2026-10-10,Receipt,RCP-2026-10-0587,Course Fee Income - JEE,0.00,12711.86,Instalment 2 part fee",
-      "2026-10-10,Receipt,RCP-2026-10-0587,Output CGST 9%,0.00,1144.07,CGST @ 9% on SAC 999293",
-      "2026-10-10,Receipt,RCP-2026-10-0587,Output SGST 9%,0.00,1144.07,SGST @ 9% on SAC 999293",
-      "2026-10-28,Journal,CRN-2026-10-1038,Refund Payable - Kavya Rathore,63724.14,0.00,Approved pro-rata withdrawal refund",
-      "2026-10-28,Journal,CRN-2026-10-1038,Course Fee Income - NEET,0.00,63724.14,Reversal of unearned tuition",
-      "2026-10-31,Receipt,REC-UNMATCHED-001,Unallocated Suspense A/c,15000.00,0.00,pay_demo_a91c ref MOHIT G 0219 unallocated",
+    const headers = [
+      "VoucherDate",
+      "VoucherType",
+      "VoucherNo",
+      "LedgerName",
+      "Debit",
+      "Credit",
+      "Narration",
     ];
 
-    const encodedUri = encodeURI("data:text/csv;charset=utf-8," + csvRows.join("\n"));
+    const dataRows = [
+      ["2026-10-10", "Receipt", "RCP-2026-10-0412", "HDFC Bank Current A/c", "30000.00", "0.00", "Tuition fee STU-0412 Aarav Meena"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0412", "Course Fee Income - JEE", "0.00", "25423.73", "Instalment 1 fee income"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0412", "Output CGST 9%", "0.00", "2288.14", "CGST @ 9% on SAC 999293"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0412", "Output SGST 9%", "0.00", "2288.14", "SGST @ 9% on SAC 999293"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0587", "HDFC Bank Current A/c", "15000.00", "0.00", "Part fee STU-0587 Ishita Sharma"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0587", "Course Fee Income - JEE", "0.00", "12711.86", "Instalment 2 part fee"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0587", "Output CGST 9%", "0.00", "1144.07", "CGST @ 9% on SAC 999293"],
+      ["2026-10-10", "Receipt", "RCP-2026-10-0587", "Output SGST 9%", "0.00", "1144.07", "SGST @ 9% on SAC 999293"],
+      ["2026-10-28", "Journal", "CRN-2026-10-1038", "Refund Payable - Kavya Rathore", "63724.14", "0.00", "Approved pro-rata withdrawal refund"],
+      ["2026-10-28", "Journal", "CRN-2026-10-1038", "Course Fee Income - NEET", "0.00", "63724.14", "Reversal of unearned tuition"],
+      ["2026-10-31", "Receipt", "REC-UNMATCHED-001", "Unallocated Suspense A/c", "15000.00", "0.00", "pay_demo_a91c ref MOHIT G 0219 unallocated"],
+    ];
+
+    const csvContent = buildCsvDocument(headers, dataRows);
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `tally_export_TX-2026-10-001.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showToast("Downloaded Tally CSV export batch TX-2026-10-001 (409 vouchers, 3 credit notes).");
+    URL.revokeObjectURL(url);
+    showToast("Downloaded Tally CSV export batch TX-2026-10-001 (formula-neutralized).");
   };
 
   const handleConfirmCloseMonth = () => {

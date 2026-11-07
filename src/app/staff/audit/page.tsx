@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { StatusChip } from "@/components/shared/StatusChip";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
+import { buildCsvDocument } from "@/lib/csv-sanitizer";
 import {
   History,
   ShieldCheck,
@@ -125,23 +126,28 @@ export default function AuditAndHealthPage() {
   };
 
   const handleExportAudit = () => {
-    const csvContent =
-      "data:text/csv;charset=utf-8," +
-      ["Timestamp,Actor,Role,Action,Target,Hash,Details"]
-        .concat(
-          filteredLogs.map(
-            (l) => `"${l.timestamp}","${l.actor}","${l.role}","${l.action}","${l.target}","${l.hash}","${l.details}"`
-          )
-        )
-        .join("\n");
-    const encodedUri = encodeURI(csvContent);
+    const headers = ["Timestamp", "Actor", "Role", "Action", "Target", "Hash", "Details"];
+    const rows = filteredLogs.map((l) => [
+      l.timestamp,
+      l.actor,
+      l.role,
+      l.action,
+      l.target,
+      l.hash,
+      l.details,
+    ]);
+
+    const csvContent = buildCsvDocument(headers, rows);
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `feeflow_audit_trail_20261102.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showToast("Audit trail exported successfully as CSV.");
+    URL.revokeObjectURL(url);
+    showToast("Audit trail exported successfully (formula-neutralized).");
   };
 
   return (

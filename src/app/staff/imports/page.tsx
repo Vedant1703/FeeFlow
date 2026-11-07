@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { StatusChip } from "@/components/shared/StatusChip";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
+import { buildCsvDocument } from "@/lib/csv-sanitizer";
 import {
   UploadCloud,
   FileSpreadsheet,
@@ -105,40 +106,59 @@ export default function BulkImportsPage() {
   };
 
   const handleDownloadTemplate = (type: "ATTENDANCE" | "TESTS") => {
-    const csvContent =
-      type === "ATTENDANCE"
-        ? "student_code,student_name,date,session_topic,status\nSTU-0587,Ishita Sharma,2026-10-28,Physics Rotational,Present\nSTU-0731,Rohan Saini,2026-10-28,Physics Rotational,Absent\n"
-        : "student_code,student_name,test_date,test_name,physics,chemistry,maths,total,max_marks\nSTU-0587,Ishita Sharma,2026-10-26,Phase Test 3,78,84,72,234,300\n";
+    let csvContent = "";
+    if (type === "ATTENDANCE") {
+      csvContent = buildCsvDocument(
+        ["student_code", "student_name", "date", "session_topic", "status"],
+        [
+          ["STU-0587", "Ishita Sharma", "2026-10-28", "Physics Rotational", "Present"],
+          ["STU-0731", "Rohan Saini", "2026-10-28", "Physics Rotational", "Absent"],
+        ]
+      );
+    } else {
+      csvContent = buildCsvDocument(
+        ["student_code", "student_name", "test_date", "test_name", "physics", "chemistry", "maths", "total", "max_marks"],
+        [
+          ["STU-0587", "Ishita Sharma", "2026-10-26", "Phase Test 3", 78, 84, 72, 234, 300],
+        ]
+      );
+    }
 
-    const encodedUri = encodeURI("data:text/csv;charset=utf-8," + csvContent);
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `feeflow_${type.toLowerCase()}_template.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showToast(`Downloaded ${type} CSV template`);
+    URL.revokeObjectURL(url);
+    showToast(`Downloaded ${type} CSV template (formula-neutralized).`);
   };
 
   const handleDownloadErrorCsv = () => {
     const invalidRows = rows.filter((r) => r.status === "INVALID");
-    const csvContent =
-      "Row,StudentCode,StudentName,Field,AttemptedValue,ErrorReason\n" +
-      invalidRows
-        .map(
-          (r) =>
-            `"${r.rowNo}","${r.studentCode}","${r.studentName}","${r.field}","${r.newValue}","${r.reason}"`
-        )
-        .join("\n");
+    const headers = ["Row", "StudentCode", "StudentName", "Field", "AttemptedValue", "ErrorReason"];
+    const dataRows = invalidRows.map((r) => [
+      r.rowNo,
+      r.studentCode,
+      r.studentName,
+      r.field,
+      r.newValue,
+      r.reason || "Validation failed",
+    ]);
 
-    const encodedUri = encodeURI("data:text/csv;charset=utf-8," + csvContent);
+    const csvContent = buildCsvDocument(headers, dataRows);
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `import_errors_${fileName}`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showToast(`Downloaded Error CSV with ${invalidRows.length} flagged rows.`);
+    URL.revokeObjectURL(url);
+    showToast(`Downloaded Error CSV with ${invalidRows.length} flagged rows (formula-neutralized).`);
   };
 
   const handleCommit = () => {
