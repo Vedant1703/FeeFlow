@@ -89,3 +89,4 @@ describe("Domain: matching.ts — Accounts Queue Unmatched Payment Scorer", () =
     expect(res.candidates).toHaveLength(0);
   });
 });
+

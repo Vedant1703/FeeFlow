@@ -1,6 +1,6 @@
 # Technical Design Document — FeeFlow
 
-- **GitHub Repository:** https://github.com/vedantkulkarni/feeflow (Public)
+- **GitHub Repository:** https://github.com/Vedant1703/feeflow (Public)
 - **Live Deployment URL:** https://feeflow.vercel.app
 - **Candidate:** Vedant Vinod Kulkarni
 - **Problem Statement:** Brief 4 — Coaching Institute's Fee Tracking System and Parent Portal (Company A, Jaipur)
@@ -40,3 +40,4 @@
 ## 7. What Was Cut & What Comes Next
 - **Cut for Take-Home Scope:** Live SMS/WhatsApp gateway, production Razorpay merchant settlement file ingestion, staff MFA, multi-institute tenancy, and LMS/timetables/admissions CRM (out of scope).
 - **Next Steps for Production:** Connect live WhatsApp Business & Razorpay webhooks, complete legal/CA sign-off on DPDP notice text and GST credit-note series, and calibrate risk weights against historical cohort retention data.
+

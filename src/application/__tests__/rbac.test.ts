@@ -98,3 +98,4 @@ describe("Application: Role-Based Access Control (RBAC) & Scoping", () => {
     expect(validApprove.allowed).toBe(true);
   });
 });
+

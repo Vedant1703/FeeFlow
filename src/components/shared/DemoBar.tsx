@@ -27,3 +27,4 @@ export function DemoBar({ className }: { className?: string }) {
     </div>
   );
 }
+

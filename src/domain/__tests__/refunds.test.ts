@@ -176,3 +176,4 @@ describe("Domain: refunds.ts — MoE 2024 Pro-Rata Math", () => {
     expect(validApproval.allowed).toBe(true);
   });
 });
+

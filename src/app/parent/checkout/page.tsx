@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { DemoBar } from "@/components/shared/DemoBar";
 import { ProvenanceChip } from "@/components/shared/ProvenanceChip";
@@ -16,7 +16,7 @@ import {
   Building,
 } from "lucide-react";
 
-export default function MockCheckoutPage() {
+function CheckoutContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const orderId = searchParams.get("orderId") || "order_demo_10oct";
@@ -249,3 +249,18 @@ export default function MockCheckoutPage() {
     </div>
   );
 }
+
+export default function MockCheckoutPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-paper flex items-center justify-center text-xs text-ink-3">
+          Loading checkout...
+        </div>
+      }
+    >
+      <CheckoutContent />
+    </Suspense>
+  );
+}
+

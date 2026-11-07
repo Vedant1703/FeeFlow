@@ -142,3 +142,4 @@ export function scorePaymentCandidates(
     topCandidate: scoredCandidates.length > 0 ? scoredCandidates[0] : null,
   };
 }
+

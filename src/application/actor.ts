@@ -108,3 +108,4 @@ export function canActorReviewRisk(actor: Actor, centreId?: string): boolean {
   }
   return false;
 }
+

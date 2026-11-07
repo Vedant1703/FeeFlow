@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/infrastructure/db/prisma";
 import { createSessionToken, SESSION_COOKIE_NAME } from "@/infrastructure/auth/session";
 import { Actor } from "@/application/actor";
+import { findDemoUserByEmail } from "@/infrastructure/db/demo-data";
 
 export async function POST(req: Request) {
   try {
@@ -15,16 +16,48 @@ export async function POST(req: Request) {
       );
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase().trim() },
-      include: {
-        userCentres: true,
-      },
-    });
+    const normalizedEmail = email.toLowerCase().trim();
+    let user: any = null;
+
+    try {
+      user = await prisma.user.findUnique({
+        where: { email: normalizedEmail },
+        include: {
+          userCentres: true,
+        },
+      });
+    } catch (dbError) {
+      // In demo mode or offline, fallback to in-memory demo staff accounts
+      const demo = findDemoUserByEmail(normalizedEmail);
+      if (demo) {
+        user = {
+          id: demo.id,
+          name: demo.name,
+          email: demo.email,
+          role: demo.role,
+          passwordHash: demo.passwordHash,
+          userCentres: demo.centreIds.map((cid) => ({ centreId: cid })),
+        };
+      }
+    }
+
+    if (!user) {
+      const demo = findDemoUserByEmail(normalizedEmail);
+      if (demo) {
+        user = {
+          id: demo.id,
+          name: demo.name,
+          email: demo.email,
+          role: demo.role,
+          passwordHash: demo.passwordHash,
+          userCentres: demo.centreIds.map((cid) => ({ centreId: cid })),
+        };
+      }
+    }
 
     if (!user || user.passwordHash !== password) {
       return NextResponse.json(
-        { error: "Invalid email or password" },
+        { error: "Invalid email or password. In demo mode, use DemoPassword123!" },
         { status: 401 }
       );
     }
@@ -34,7 +67,7 @@ export async function POST(req: Request) {
       role: user.role as any,
       name: user.name,
       email: user.email,
-      centreIds: user.userCentres.map((uc) => uc.centreId),
+      centreIds: user.userCentres.map((uc: any) => uc.centreId),
       linkedStudentIds: [],
       consentedStudentIds: [],
     };

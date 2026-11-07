@@ -154,3 +154,4 @@ describe("Domain: ledger.ts", () => {
     expect(validation.error).toContain("over-credited");
   });
 });
+

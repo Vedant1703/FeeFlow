@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { DemoBar } from "@/components/shared/DemoBar";
@@ -18,7 +18,7 @@ import {
   FileText,
 } from "lucide-react";
 
-export default function PaymentStatusPage() {
+function PaymentStatusContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const status = searchParams.get("status") || "succeeded";
@@ -200,5 +200,19 @@ export default function PaymentStatusPage() {
         )}
       </main>
     </div>
+  );
+}
+
+export default function PaymentStatusPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-paper flex items-center justify-center text-xs text-ink-3">
+          Loading payment status...
+        </div>
+      }
+    >
+      <PaymentStatusContent />
+    </Suspense>
   );
 }
