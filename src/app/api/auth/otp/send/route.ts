@@ -5,8 +5,13 @@ import { otpService, normalizeIndianPhoneNumber } from "@/infrastructure/auth/ot
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const { phone } = body;
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON request body" }, { status: 400 });
+    }
+    const { phone } = body || {};
 
     if (!phone) {
       return NextResponse.json({ error: "Phone number is required" }, { status: 400 });

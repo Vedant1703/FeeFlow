@@ -45,6 +45,19 @@ describe("Authentication & Session API Integration Tests", () => {
       const res = await sendOtp(req);
       expect(res.status).toBe(400);
     });
+
+    it("returns 400 when request body is malformed JSON", async () => {
+      const req = new Request("http://localhost:3000/api/auth/otp/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "invalid-json{",
+      });
+
+      const res = await sendOtp(req);
+      const data = await res.json();
+      expect(res.status).toBe(400);
+      expect(data.error).toBe("Invalid JSON request body");
+    });
   });
 
   describe("Parent OTP Verify (/api/auth/otp/verify)", () => {
@@ -160,6 +173,20 @@ describe("Authentication & Session API Integration Tests", () => {
 
       expect(res.status).toBe(401);
       expect(data.error).toContain("Invalid email or password");
+    });
+
+    it("returns 400 when request body is malformed JSON", async () => {
+      const req = new Request("http://localhost:3000/api/auth/staff/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{malformed: json",
+      });
+
+      const res = await staffLogin(req);
+      const data = await res.json();
+
+      expect(res.status).toBe(400);
+      expect(data.error).toBe("Invalid JSON request body");
     });
   });
 });
