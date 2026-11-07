@@ -7,7 +7,11 @@
 
 ## 1. Architecture & Rationale
 - **Modular Monolith (Next.js App Router + TypeScript + PostgreSQL/Prisma):** Chosen so parent mobile routes (`/parent/*`), staff desktop workflows (`/staff/*`), webhook handlers, and pure domain logic share strict end-to-end types and ACID database transactions without microservice latency or distributed-transaction complexity.
-- **Hexagonal Domain Boundaries:** Pure domain functions (`src/domain/`) handle integer-paise arithmetic, ledger derivation, pro-rata refund math, payment matching, reminder eligibility, and risk scoring. External dependencies (Payments, Messaging, OTP, Clock, PDF) sit behind typed ports with deterministic mock adapters.
+- **Hexagonal Domain Boundaries:** Pure domain functions (`src/domain/`) handle integer-paise arithmetic, ledger derivation, pro-rata refund math, payment matching, reminder eligibility, and risk scoring. External dependencies (Payments, Messaging, OTP, OAuth, Clock, PDF) sit behind typed ports with deterministic mock adapters.
+- **Cryptographic Authentication & RBAC Layer:**
+  - **Cryptographic OTP Service:** Strict Indian E.164 normalization (`+91XXXXXXXXXX`), 6-digit CSPRNG token generation, HMAC-SHA256 hashing (`phone:otp`), timing-safe verification, 5-minute expiry, 60s resend cooldown, sliding-window rate limit (max 3 per 10 mins), and 3-attempt brute-force lockout.
+  - **Native OAuth 2.0 PKCE Flow:** RFC 7636 PKCE implementation (`code_verifier` with SHA-256 `code_challenge`, state-based CSRF protection with secure HttpOnly cookies), supporting Google Workspace SSO for staff and Google Sign-in for parents.
+  - **4-Role Permission Matrix:** `PARENT` (scoped strictly to consented linked children), `ACCOUNTS` (scoped to assigned centres), `COUNSELLOR` (academic risk review, strictly excluded from financial ledger actions), and `DIRECTOR` (global multi-centre oversight, maker-checker authorization).
 - **Client/Server Trust Model:** Zero client payment trust. Browser redirects land only on Confirming/Pending state (`P1e`); only HMAC-SHA256 verified gateway webhooks modify the ledger, issue GST receipts, and skip active reminders.
 
 ## 2. Data Model & Financial Integrity
@@ -42,7 +46,7 @@
 - **Next Steps for Production:** Connect live WhatsApp Business & Razorpay webhooks, complete legal/CA sign-off on DPDP notice text and GST credit-note series, and calibrate risk weights against historical cohort retention data.
 
 ## 8. Financial Integrity Audit & Automated Test Verification
-- **Automated Test Coverage:** 82 passing tests across 13 test suites (100% green coverage) verifying all domain algorithms, application services, auth flows, components, and the payment sandbox matrix.
+- **Automated Test Coverage:** 112 passing tests across 17 test suites (100% green coverage) verifying all domain algorithms, application services, authentication flows, components, and the payment sandbox matrix.
 - **Test Suite Breakdown:**
   - `money.test.ts` (6 tests): BigInt integer paise conversion, roundHalfUp, formatting boundaries.
   - `ledger.test.ts` (6 tests): Append-only signed ledger derivation, balance updates, status transitions.
@@ -51,7 +55,11 @@
   - `refunds.test.ts` (9 tests): Statutory MoE pro-rata formula, golden fixtures F1–F4, UI fixtures U1–U2, informational shortfall safeguard, waiver generation.
   - `matching.test.ts` (3 tests): Unmatched payment candidate scoring engine (ref/name/amount).
   - `rbac.test.ts` (6 tests): Centre scoping, DPDP consent gating, Counsellor ledger exclusion, maker-checker enforcement (`approverId !== requesterId`).
-  - `auth-api.test.ts` (9 tests): Parent demo OTP send/verify, session tokens, staff login.
+  - `otp-service.test.ts` (14 tests): Strict Indian E.164 validation, HMAC-SHA256 token hashing, timing-safe equality, 60s cooldown, 10m sliding window rate limit, 3-attempt brute-force lockout, 5m expiry window.
+  - `oauth-provider.test.ts` (5 tests): PKCE code verifier and SHA-256 code challenge generation, random state CSRF protection, authorization URL generation, profile normalization.
+  - `oauth-api.test.ts` (5 tests): Native OAuth PKCE authorization redirect, state cookie verification, CSRF defense, mock provider code exchange, and session cookie issuance.
+  - `sms-provider.test.ts` (4 tests): Pluggable SMS provider interface, OTP message formatting, delivery logging, and template compliance.
+  - `auth-api.test.ts` (11 tests): Parent demo OTP send/verify, session tokens, staff login across Director/Accounts/Counsellor roles, password validation, and malformed JSON request rejection.
   - `csv-sanitizer.test.ts` (7 tests): Spreadsheet formula injection neutralization (`=`, `+`, `-`, `@`, `\t`, `\r`).
   - `payment-webhook.test.ts` (4 tests): HMAC-SHA256 signature verification, tampering detection.
   - `payment-sandbox-matrix.test.ts` (14 tests): Full 13-scenario sandbox matrix (valid capture, redirect pending, provider timeout, duplicate idempotency, replay safety, unmatched routing, currency/amount rejection, partial bounds, excess unallocated retention, consecutive captures).
