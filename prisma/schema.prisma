@@ -126,6 +126,7 @@ model User {
 
   userCentres  UserCentre[]
   parent       Parent?
+  accounts     Account[]
 }
 
 model Centre {
@@ -197,6 +198,7 @@ model Parent {
   students    ParentStudent[]
   consents    Consent[]
   dispatches  ReminderDispatch[]
+  accounts    Account[]
 }
 
 model Student {
@@ -643,4 +645,36 @@ model AuditLog {
   @@index([actorId])
   @@index([createdAt])
 }
+
+model OtpToken {
+  id          String   @id @default(cuid())
+  phone       String   // Normalized E.164 phone (+91...)
+  tokenHash   String   // SHA-256 HMAC hash of the 6-digit OTP
+  expiresAt   DateTime
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(3)
+  consumed    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([phone, expiresAt])
+  @@index([phone, consumed])
+}
+
+model Account {
+  id                String   @id @default(cuid())
+  userId            String?
+  parentId          String?
+  provider          String   // "GOOGLE", "MICROSOFT", "MOCK"
+  providerAccountId String   // Provider user ID (e.g. Google sub)
+  email             String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent Parent? @relation(fields: [parentId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([email])
+}
+
 
