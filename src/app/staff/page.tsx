@@ -48,7 +48,7 @@ export default function StaffDashboardPage() {
               </p>
             </div>
 
-            {/* Centre Filter Dropdown */}
+            {/* Centre Filter Dropdown & Quick Actions */}
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-1.5 text-xs text-ink-2 bg-surface px-3 py-1.5 rounded-input border border-line">
                 <Filter className="w-3.5 h-3.5 text-teal" />
@@ -65,6 +65,14 @@ export default function StaffDashboardPage() {
                   <option value="TR">Tonk Road</option>
                 </select>
               </div>
+
+              <Link
+                href="/staff/reconciliation"
+                className="bg-teal hover:bg-teal-d text-white font-medium px-3.5 py-1.5 rounded-input text-xs flex items-center gap-1.5 shadow-xs transition-colors"
+              >
+                <span>Month-End Close</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </Link>
             </div>
           </div>
 

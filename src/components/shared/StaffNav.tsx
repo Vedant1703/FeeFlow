@@ -14,6 +14,8 @@ import {
   Building2,
   Clock,
   Sparkles,
+  UploadCloud,
+  Scale,
 } from "lucide-react";
 
 export interface StaffNavProps {
@@ -49,6 +51,12 @@ export function StaffNav({
       roles: ["ACCOUNTS", "DIRECTOR"],
     },
     {
+      label: "Reconciliation & Tally",
+      href: "/staff/reconciliation",
+      icon: Scale,
+      roles: ["ACCOUNTS", "DIRECTOR"],
+    },
+    {
       label: "Reminder Centre",
       href: "/staff/reminders",
       icon: BellRing,
@@ -59,6 +67,12 @@ export function StaffNav({
       href: "/staff/withdrawals",
       icon: UserX,
       roles: ["ACCOUNTS", "DIRECTOR"],
+    },
+    {
+      label: "Bulk Imports",
+      href: "/staff/imports",
+      icon: UploadCloud,
+      roles: ["COUNSELLOR", "DIRECTOR", "ACCOUNTS"],
     },
     {
       label: "Risk Review",

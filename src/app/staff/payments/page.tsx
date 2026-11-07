@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import Link from "next/link";
 import { StaffNav } from "@/components/shared/StaffNav";
 import { DemoBar } from "@/components/shared/DemoBar";
 import { StatusChip } from "@/components/shared/StatusChip";
@@ -16,6 +17,7 @@ import {
   ExternalLink,
   Sparkles,
   ArrowRight,
+  ChevronRight,
   X,
 } from "lucide-react";
 
@@ -197,7 +199,7 @@ export default function StaffPaymentsPage() {
             <button
               type="button"
               onClick={() => setActiveTab("EVENTS")}
-              className={`pb-3 px-4 text-xs font-bold border-b-2 transition-colors ${
+              className={`pb-3 px-4 text-xs font-bold border-b-2 transition-colors flex items-center gap-2 ${
                 activeTab === "EVENTS"
                   ? "border-teal text-teal"
                   : "border-transparent text-ink-3 hover:text-ink"
@@ -205,6 +207,14 @@ export default function StaffPaymentsPage() {
             >
               Provider Events Log ({providerEvents.length})
             </button>
+
+            <Link
+              href="/staff/reconciliation"
+              className="pb-3 px-4 text-xs font-bold border-b-2 border-transparent text-ink-3 hover:text-teal transition-colors flex items-center gap-1.5 ml-auto"
+            >
+              <span>Month-End Reconciliation (S3b)</span>
+              <ChevronRight className="w-3.5 h-3.5" />
+            </Link>
           </div>
 
           {/* =========================================================================

@@ -90,18 +90,13 @@ export default function PaymentStatusPage() {
             </div>
 
             <div className="space-y-2.5 pt-2">
-              <button
-                type="button"
-                onClick={() =>
-                  alert(
-                    `Company A Institute, Jaipur\nOFFICIAL RECEIPT: ${receiptNo}\nStudent: Ishita Sharma (STU-0587)\nAmount: ₹15,000\nGSTIN: 08AABCC1234D1Z5 [SYNTHETIC]\nSAC: 999293\nStatus: CAPTURED & ALLOCATED`
-                  )
-                }
+              <Link
+                href={`/parent/receipts/${receiptNo}`}
                 className="w-full h-11 rounded-input border border-teal text-teal hover:bg-teal-t/20 font-semibold text-xs transition-colors flex items-center justify-center gap-2"
               >
                 <Download className="w-4 h-4" />
-                <span>Download Official GST Receipt</span>
-              </button>
+                <span>View Official GST Receipt (P3)</span>
+              </Link>
 
               <Link
                 href="/parent"

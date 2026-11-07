@@ -24,6 +24,9 @@ import {
   Clock,
   ShieldCheck,
   User,
+  GraduationCap,
+  BookOpen,
+  Award,
 } from "lucide-react";
 
 export default function ParentHomePage() {
@@ -36,7 +39,7 @@ export default function ParentHomePage() {
   const [paymentChoice, setPaymentChoice] = useState<"FULL" | "PARTIAL">("FULL");
   const [customAmountRupees, setCustomAmountRupees] = useState("5000");
   const [isCreatingIntent, setIsCreatingIntent] = useState(false);
-  const [activeTab, setActiveTab] = useState<"FEES" | "RECEIPTS">("FEES");
+  const [activeTab, setActiveTab] = useState<"FEES" | "RECEIPTS" | "ATTENDANCE" | "TESTS">("FEES");
 
   // Child data fixtures
   const isIshita = selectedChild === "ISHITA";
@@ -280,12 +283,12 @@ export default function ParentHomePage() {
           </div>
         </section>
 
-        {/* Tab Navigation: Fees Breakdown vs Receipts */}
-        <div className="flex border-b border-line pt-2">
+        {/* Tab Navigation: Fees Breakdown vs Receipts vs Attendance vs Tests (P2) */}
+        <div className="flex border-b border-line pt-2 overflow-x-auto no-scrollbar">
           <button
             type="button"
             onClick={() => setActiveTab("FEES")}
-            className={`pb-2.5 px-3 text-sm font-semibold border-b-2 transition-colors ${
+            className={`pb-2.5 px-3 text-xs font-semibold border-b-2 whitespace-nowrap transition-colors ${
               activeTab === "FEES"
                 ? "border-teal text-teal"
                 : "border-transparent text-ink-3 hover:text-ink"
@@ -296,13 +299,35 @@ export default function ParentHomePage() {
           <button
             type="button"
             onClick={() => setActiveTab("RECEIPTS")}
-            className={`pb-2.5 px-3 text-sm font-semibold border-b-2 transition-colors ${
+            className={`pb-2.5 px-3 text-xs font-semibold border-b-2 whitespace-nowrap transition-colors ${
               activeTab === "RECEIPTS"
                 ? "border-teal text-teal"
                 : "border-transparent text-ink-3 hover:text-ink"
             }`}
           >
             {t("tab_receipts")} ({studentData.receipts.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("ATTENDANCE")}
+            className={`pb-2.5 px-3 text-xs font-semibold border-b-2 whitespace-nowrap transition-colors ${
+              activeTab === "ATTENDANCE"
+                ? "border-teal text-teal"
+                : "border-transparent text-ink-3 hover:text-ink"
+            }`}
+          >
+            {language === "hi" ? "उपस्थिति" : "Attendance"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("TESTS")}
+            className={`pb-2.5 px-3 text-xs font-semibold border-b-2 whitespace-nowrap transition-colors ${
+              activeTab === "TESTS"
+                ? "border-teal text-teal"
+                : "border-transparent text-ink-3 hover:text-ink"
+            }`}
+          >
+            {language === "hi" ? "परीक्षा अंक" : "Tests & Progress"}
           </button>
         </div>
 
@@ -364,6 +389,196 @@ export default function ParentHomePage() {
         )}
 
         {/* =========================================================================
+            TAB CONTENT: ATTENDANCE PROGRESS (P2)
+           ========================================================================= */}
+        {activeTab === "ATTENDANCE" && (
+          <div className="space-y-3">
+            <div className="p-4 rounded-panel bg-surface border border-line space-y-3 shadow-2xs">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] text-ink-3 uppercase font-semibold">
+                    {language === "hi" ? "30-दिवसीय उपस्थिति दर" : "30-Day Attendance Rate"}
+                  </div>
+                  <div className="text-2xl font-bold font-mono text-teal mt-0.5">
+                    {isIshita ? "88%" : "96%"}
+                  </div>
+                </div>
+                <StatusChip
+                  tone={isIshita ? "ok" : "ok"}
+                  text={isIshita ? "Regular (22/25)" : "Exemplary (24/25)"}
+                />
+              </div>
+
+              {/* Monthly breakdown bar */}
+              <div className="space-y-1.5 pt-2 border-t border-line">
+                <div className="flex justify-between text-xs text-ink">
+                  <span>October 2026</span>
+                  <span className="font-mono font-semibold">88% (22 of 25)</span>
+                </div>
+                <div className="w-full bg-paper rounded-full h-2 overflow-hidden border border-line/60">
+                  <div className="bg-teal h-full rounded-full" style={{ width: "88%" }} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <div className="flex justify-between text-xs text-ink">
+                  <span>September 2026</span>
+                  <span className="font-mono font-semibold">92% (24 of 26)</span>
+                </div>
+                <div className="w-full bg-paper rounded-full h-2 overflow-hidden border border-line/60">
+                  <div className="bg-teal h-full rounded-full" style={{ width: "92%" }} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <div className="flex justify-between text-xs text-ink">
+                  <span>August 2026</span>
+                  <span className="font-mono font-semibold">90% (23 of 25)</span>
+                </div>
+                <div className="w-full bg-paper rounded-full h-2 overflow-hidden border border-line/60">
+                  <div className="bg-teal h-full rounded-full" style={{ width: "90%" }} />
+                </div>
+              </div>
+            </div>
+
+            {/* Recent Classroom Sessions */}
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-ink-2 px-1">
+                {language === "hi" ? "हाल के सत्र" : "Recent Classroom Sessions"}
+              </div>
+              {[
+                { date: "02 Nov 2026", subject: "Physics — Rotational Dynamics", status: "Present" },
+                { date: "01 Nov 2026", subject: "Chemistry — Coordination Compounds", status: "Present" },
+                { date: "31 Oct 2026", subject: "Mathematics — Definite Integration", status: "Present" },
+                { date: "30 Oct 2026", subject: "Physics — Centre of Mass", status: "Present" },
+                { date: "29 Oct 2026", subject: "Chemistry — Thermodynamics Revision", status: "Absent" },
+              ].map((sess, idx) => (
+                <div
+                  key={idx}
+                  className="p-3 rounded-panel bg-surface border border-line flex items-center justify-between text-xs"
+                >
+                  <div>
+                    <div className="font-semibold text-ink">{sess.subject}</div>
+                    <div className="text-[11px] text-ink-3">{sess.date}</div>
+                  </div>
+                  <StatusChip
+                    tone={sess.status === "Present" ? "ok" : "bad"}
+                    text={sess.status}
+                    size="sm"
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="text-[11px] text-ink-3 text-center pt-2">
+              Attendance records synced from Vaishali Nagar biometric gates.
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
+            TAB CONTENT: TEST SCORES & PROGRESS (P2)
+           ========================================================================= */}
+        {activeTab === "TESTS" && (
+          <div className="space-y-3">
+            <div className="p-4 rounded-panel bg-surface border border-line space-y-3 shadow-2xs">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] text-ink-3 uppercase font-semibold">
+                    {language === "hi" ? "औसत बैच परसेंटाइल" : "Cohort Batch Percentile"}
+                  </div>
+                  <div className="text-2xl font-bold font-mono text-teal mt-0.5">
+                    {isIshita ? "84.2 %ile" : "92.6 %ile"}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[11px] text-ink-3 uppercase font-semibold">
+                    {language === "hi" ? "नवीनतम टेस्ट रैंक" : "Latest Test Rank"}
+                  </div>
+                  <div className="text-base font-bold font-mono text-ink mt-0.5">
+                    {isIshita ? "14 / 120" : "5 / 115"}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Test History List */}
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-ink-2 px-1">
+                {language === "hi" ? "टेस्ट परिणाम" : "Periodic Test Results"}
+              </div>
+
+              {[
+                {
+                  name: "Phase Test 3 — JEE Main Pattern",
+                  date: "26 Oct 2026",
+                  phy: 78,
+                  chem: 84,
+                  math: 72,
+                  total: 234,
+                  max: 300,
+                  rank: "14 / 120",
+                },
+                {
+                  name: "Fortnightly Test 5",
+                  date: "12 Oct 2026",
+                  phy: 82,
+                  chem: 88,
+                  math: 80,
+                  total: 250,
+                  max: 300,
+                  rank: "9 / 120",
+                },
+                {
+                  name: "Phase Test 2 — Advanced Pattern",
+                  date: "28 Sep 2026",
+                  phy: 80,
+                  chem: 82,
+                  math: 78,
+                  total: 240,
+                  max: 300,
+                  rank: "12 / 120",
+                },
+              ].map((test, idx) => (
+                <div
+                  key={idx}
+                  className="p-3.5 rounded-panel bg-surface border border-line space-y-2 text-xs shadow-2xs"
+                >
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <div className="font-bold text-ink">{test.name}</div>
+                      <div className="text-[11px] text-ink-3">{test.date}</div>
+                    </div>
+                    <span className="font-mono font-bold text-teal bg-teal-t px-2 py-0.5 rounded text-xs">
+                      {test.total} / {test.max}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 pt-2 border-t border-line/60 text-[11px]">
+                    <div className="bg-paper p-1.5 rounded text-center">
+                      <span className="text-ink-3 block">Physics</span>
+                      <span className="font-mono font-bold text-ink">{test.phy}/100</span>
+                    </div>
+                    <div className="bg-paper p-1.5 rounded text-center">
+                      <span className="text-ink-3 block">Chemistry</span>
+                      <span className="font-mono font-bold text-ink">{test.chem}/100</span>
+                    </div>
+                    <div className="bg-paper p-1.5 rounded text-center">
+                      <span className="text-ink-3 block">Maths</span>
+                      <span className="font-mono font-bold text-ink">{test.math}/100</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="p-3 bg-paper rounded-xl border border-line text-[11px] text-ink-3 text-center">
+              Academic evaluation is advisory only and strictly decoupled from fee tracking.
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
             TAB CONTENT: RECEIPTS
            ========================================================================= */}
         {activeTab === "RECEIPTS" && (
@@ -399,21 +614,206 @@ export default function ParentHomePage() {
                     <div className="font-mono text-sm font-bold text-ink">
                       {formatINR(r.amount)}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        alert(
-                          `Official Tax Invoice / Receipt: ${r.receiptNo}\nAmount: ${formatINR(r.amount)}\nGSTIN: ${r.gstin}\nSAC: 999293\nVerified Captured Payment`
-                        )
-                      }
+                    <Link
+                      href={`/parent/receipts/${r.receiptNo}`}
                       className="inline-flex items-center gap-1 text-[11px] text-teal hover:underline font-semibold"
                     >
                       <Download className="w-3 h-3" />
-                      <span>Receipt</span>
-                    </button>
+                      <span>Receipt (P3)</span>
+                    </Link>
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
+            TAB CONTENT: ATTENDANCE PROGRESS (P2)
+           ========================================================================= */}
+        {activeTab === "ATTENDANCE" && (
+          <div className="space-y-3">
+            <div className="p-4 rounded-panel bg-surface border border-line space-y-3 shadow-2xs">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] text-ink-3 uppercase font-semibold">
+                    {language === "hi" ? "30-दिवसीय उपस्थिति दर" : "30-Day Attendance Rate"}
+                  </div>
+                  <div className="text-2xl font-bold font-mono text-teal mt-0.5">
+                    {isIshita ? "88%" : "96%"}
+                  </div>
+                </div>
+                <StatusChip
+                  tone={isIshita ? "ok" : "ok"}
+                  text={isIshita ? "Regular (22/25)" : "Exemplary (24/25)"}
+                />
+              </div>
+
+              {/* Monthly breakdown bar */}
+              <div className="space-y-1.5 pt-2 border-t border-line">
+                <div className="flex justify-between text-xs text-ink">
+                  <span>October 2026</span>
+                  <span className="font-mono font-semibold">88% (22 of 25)</span>
+                </div>
+                <div className="w-full bg-paper rounded-full h-2 overflow-hidden border border-line/60">
+                  <div className="bg-teal h-full rounded-full" style={{ width: "88%" }} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <div className="flex justify-between text-xs text-ink">
+                  <span>September 2026</span>
+                  <span className="font-mono font-semibold">92% (24 of 26)</span>
+                </div>
+                <div className="w-full bg-paper rounded-full h-2 overflow-hidden border border-line/60">
+                  <div className="bg-teal h-full rounded-full" style={{ width: "92%" }} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <div className="flex justify-between text-xs text-ink">
+                  <span>August 2026</span>
+                  <span className="font-mono font-semibold">90% (23 of 25)</span>
+                </div>
+                <div className="w-full bg-paper rounded-full h-2 overflow-hidden border border-line/60">
+                  <div className="bg-teal h-full rounded-full" style={{ width: "90%" }} />
+                </div>
+              </div>
+            </div>
+
+            {/* Recent Classroom Sessions */}
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-ink-2 px-1">
+                {language === "hi" ? "हाल के सत्र" : "Recent Classroom Sessions"}
+              </div>
+              {[
+                { date: "02 Nov 2026", subject: "Physics — Rotational Dynamics", status: "Present" },
+                { date: "01 Nov 2026", subject: "Chemistry — Coordination Compounds", status: "Present" },
+                { date: "31 Oct 2026", subject: "Mathematics — Definite Integration", status: "Present" },
+                { date: "30 Oct 2026", subject: "Physics — Centre of Mass", status: "Present" },
+                { date: "29 Oct 2026", subject: "Chemistry — Thermodynamics Revision", status: "Absent" },
+              ].map((sess, idx) => (
+                <div
+                  key={idx}
+                  className="p-3 rounded-panel bg-surface border border-line flex items-center justify-between text-xs"
+                >
+                  <div>
+                    <div className="font-semibold text-ink">{sess.subject}</div>
+                    <div className="text-[11px] text-ink-3">{sess.date}</div>
+                  </div>
+                  <StatusChip
+                    tone={sess.status === "Present" ? "ok" : "bad"}
+                    text={sess.status}
+                    size="sm"
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="text-[11px] text-ink-3 text-center pt-2">
+              Attendance records synced from Vaishali Nagar biometric gates.
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
+            TAB CONTENT: TEST SCORES & PROGRESS (P2)
+           ========================================================================= */}
+        {activeTab === "TESTS" && (
+          <div className="space-y-3">
+            <div className="p-4 rounded-panel bg-surface border border-line space-y-3 shadow-2xs">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] text-ink-3 uppercase font-semibold">
+                    {language === "hi" ? "औसत बैच परसेंटाइल" : "Cohort Batch Percentile"}
+                  </div>
+                  <div className="text-2xl font-bold font-mono text-teal mt-0.5">
+                    {isIshita ? "84.2 %ile" : "92.6 %ile"}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[11px] text-ink-3 uppercase font-semibold">
+                    {language === "hi" ? "नवीनतम टेस्ट रैंक" : "Latest Test Rank"}
+                  </div>
+                  <div className="text-base font-bold font-mono text-ink mt-0.5">
+                    {isIshita ? "14 / 120" : "5 / 115"}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Test History List */}
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-ink-2 px-1">
+                {language === "hi" ? "टेस्ट परिणाम" : "Periodic Test Results"}
+              </div>
+
+              {[
+                {
+                  name: "Phase Test 3 — JEE Main Pattern",
+                  date: "26 Oct 2026",
+                  phy: 78,
+                  chem: 84,
+                  math: 72,
+                  total: 234,
+                  max: 300,
+                  rank: "14 / 120",
+                },
+                {
+                  name: "Fortnightly Test 5",
+                  date: "12 Oct 2026",
+                  phy: 82,
+                  chem: 88,
+                  math: 80,
+                  total: 250,
+                  max: 300,
+                  rank: "9 / 120",
+                },
+                {
+                  name: "Phase Test 2 — Advanced Pattern",
+                  date: "28 Sep 2026",
+                  phy: 80,
+                  chem: 82,
+                  math: 78,
+                  total: 240,
+                  max: 300,
+                  rank: "12 / 120",
+                },
+              ].map((test, idx) => (
+                <div
+                  key={idx}
+                  className="p-3.5 rounded-panel bg-surface border border-line space-y-2 text-xs shadow-2xs"
+                >
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <div className="font-bold text-ink">{test.name}</div>
+                      <div className="text-[11px] text-ink-3">{test.date}</div>
+                    </div>
+                    <span className="font-mono font-bold text-teal bg-teal-t px-2 py-0.5 rounded text-xs">
+                      {test.total} / {test.max}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 pt-2 border-t border-line/60 text-[11px]">
+                    <div className="bg-paper p-1.5 rounded text-center">
+                      <span className="text-ink-3 block">Physics</span>
+                      <span className="font-mono font-bold text-ink">{test.phy}/100</span>
+                    </div>
+                    <div className="bg-paper p-1.5 rounded text-center">
+                      <span className="text-ink-3 block">Chemistry</span>
+                      <span className="font-mono font-bold text-ink">{test.chem}/100</span>
+                    </div>
+                    <div className="bg-paper p-1.5 rounded text-center">
+                      <span className="text-ink-3 block">Maths</span>
+                      <span className="font-mono font-bold text-ink">{test.math}/100</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="p-3 bg-paper rounded-xl border border-line text-[11px] text-ink-3 text-center">
+              Academic evaluation is advisory only and strictly decoupled from fee tracking.
             </div>
           </div>
         )}
