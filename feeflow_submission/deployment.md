@@ -9,7 +9,7 @@
 
 1. **Clone the repository and install dependencies:**
    ```bash
-   git clone https://github.com/vedantkulkarni/feeflow.git
+   git clone https://github.com/Vedant1703/feeflow.git
    cd feeflow
    npm install
    ```

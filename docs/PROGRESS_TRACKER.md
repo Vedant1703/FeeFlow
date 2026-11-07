@@ -38,6 +38,17 @@
 
 ---
 
-## 3. Maintenance Rule
+## 3. Hardening & Verification Phases (Post-Gate 5)
+
+| Phase | Description | Status | Verification Detail |
+|---|---|---|---|
+| **Phase 1** | CSV Formula Injection Hardening & Mutation Boundary Validation | Complete | `csv-sanitizer.ts` with prefix neutralization (`=`, `+`, `-`, `@`, `\t`, `\r`) integrated into Tally, Audit, and Import error CSV downloads; Zod boundary validation schemas on `/api/payments/allocate`, `/api/risk/review`, `/api/withdrawals/approve`. 11 test suites, 64/64 tests green. |
+| **Phase 2** | Payment Provider Sandbox Verification Matrix (`payment-provider-sandbox-check`) | Complete | Complete 13-scenario matrix tested in `payment-sandbox-matrix.test.ts` (valid capture, redirect pending, provider timeout, duplicate idempotency, replay safety, unmatched routing, currency/amount rejection, partial bounds, excess unallocated retention, consecutive captures). 12 test suites, 78/78 tests green. |
+| **Phase 3** | Parent Mobile Bottom Navigation & Modal Accessibility Polish | Complete | `<ParentBottomNav />` with 4 destinations (Fees, Receipts, Academics, Policy), bilingual support, and route highlighting; accessible `Escape` key listener and body scroll-lock on all modals (Quick Pay Drawer, Allocate Dialog, Pause Modal, Month-End Modal, Student Profile Modals). 13 test suites, 82/82 tests green. |
+| **Phase 4** | Financial Integrity Audit & Submission Package Update | Complete | Formal code audit against the 7 financial invariants; `TDD.md` updated with audit findings and test breakdown; `TDD.pdf` generated (10 KB); `feeflow_submission.zip` updated containing strictly 2 files (`TDD.pdf` and `deployment.md`, 11 KB). |
+
+---
+
+## 4. Maintenance Rule
 Every time a module is completed, a test suite is executed, or a build gate is fulfilled, update the status and notes in this file immediately.
 

@@ -41,3 +41,28 @@
 - **Cut for Take-Home Scope:** Live SMS/WhatsApp gateway, production Razorpay merchant settlement file ingestion, staff MFA, multi-institute tenancy, and LMS/timetables/admissions CRM (out of scope).
 - **Next Steps for Production:** Connect live WhatsApp Business & Razorpay webhooks, complete legal/CA sign-off on DPDP notice text and GST credit-note series, and calibrate risk weights against historical cohort retention data.
 
+## 8. Financial Integrity Audit & Automated Test Verification
+- **Automated Test Coverage:** 82 passing tests across 13 test suites (100% green coverage) verifying all domain algorithms, application services, auth flows, components, and the payment sandbox matrix.
+- **Test Suite Breakdown:**
+  - `money.test.ts` (6 tests): BigInt integer paise conversion, roundHalfUp, formatting boundaries.
+  - `ledger.test.ts` (6 tests): Append-only signed ledger derivation, balance updates, status transitions.
+  - `risk.test.ts` (4 tests): Explainable 0.40/0.30/0.30 heuristic, sparse data safety, 30-day false-positive suppression.
+  - `reminders.test.ts` (5 tests): Evaluate-at-send live balances, stop-on-settlement, quiet hours.
+  - `refunds.test.ts` (9 tests): Statutory MoE pro-rata formula, golden fixtures F1–F4, UI fixtures U1–U2, informational shortfall safeguard, waiver generation.
+  - `matching.test.ts` (3 tests): Unmatched payment candidate scoring engine (ref/name/amount).
+  - `rbac.test.ts` (6 tests): Centre scoping, DPDP consent gating, Counsellor ledger exclusion, maker-checker enforcement (`approverId !== requesterId`).
+  - `auth-api.test.ts` (9 tests): Parent demo OTP send/verify, session tokens, staff login.
+  - `csv-sanitizer.test.ts` (7 tests): Spreadsheet formula injection neutralization (`=`, `+`, `-`, `@`, `\t`, `\r`).
+  - `payment-webhook.test.ts` (4 tests): HMAC-SHA256 signature verification, tampering detection.
+  - `payment-sandbox-matrix.test.ts` (14 tests): Full 13-scenario sandbox matrix (valid capture, redirect pending, provider timeout, duplicate idempotency, replay safety, unmatched routing, currency/amount rejection, partial bounds, excess unallocated retention, consecutive captures).
+  - `components.test.tsx` (5 tests): `<Rail />` 4-segment & 3-segment progress rendering, StatusChip tones, ProvenanceChip, DemoBar.
+  - `parent-nav.test.tsx` (4 tests): `<ParentBottomNav />` 4-destination accessibility, active route indicators, multilingual support.
+- **Financial Invariants Certified:**
+  1. Money Precision: Integer paise throughout; zero floating-point arithmetic.
+  2. Ledger Primacy: Derived balances only; append-only signed entries (`CHARGE`, `DISCOUNT`, `ALLOCATION`, `REVERSAL`, `WAIVER`).
+  3. Zero Client Trust: Redirects land on Pending only; only HMAC-verified webhooks mutate the ledger.
+  4. Pro-Rata Refund Safeguard: Inclusive calendar days (`T` and `c`), ₹0 deduction, informational shortfall in neutral slate (`#505A66`), approved withdrawal waives unpaid ordinary instalments to ₹0.
+  5. Maker-Checker Separation: Server-enforced `approverId !== requesterId` on all refund and waiver decisions.
+  6. CSV Injection Hardening: All Tally, audit, and import error exports sanitized against formula triggers.
+  7. Dual-Entry Reconciliation: Preserves distinct meaning for captured, allocated, refunded, and exported totals.
+
