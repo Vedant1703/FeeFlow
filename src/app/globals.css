@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ink: #17191A;
+  --ink-2: #4B5254;
+  --ink-3: #7B8386;
+  --paper: #FAF8F4;
+  --surface: #FFFFFF;
+  --line: #E8E4DB;
+  --line-2: #D6D1C5;
+  --teal: #0B5D5A;
+  --teal-d: #074341;
+  --teal-t: #E1EFEC;
+  --ok: #1E7A4F;
+  --ok-t: #E3F3EA;
+  --warn: #8F5600;
+  --warn-t: #FDF0D5;
+  --bad: #B3261E;
+  --bad-t: #FCE7E4;
+  --info: #2A5DA8;
+  --info-t: #E5EDF8;
+  --slate: #505A66;
+  --slate-t: #ECEEF1;
+  --radius-input: 8px;
+  --radius-panel: 12px;
+  --radius-hero: 18px;
+  --focus-ring: 0 0 0 3px rgba(11, 93, 90, 0.28);
+}
+
+body {
+  font-feature-settings: "tnum" 1, "cv11" 1;
+  background: var(--paper);
+  color: var(--ink);
+  min-height: 100vh;
+}
+
+:lang(hi) {
+  line-height: 1.5;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .rail i {
+    transform-origin: left;
+    animation: fill 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+  .rail i:nth-child(2) {
+    animation-delay: 0.08s;
+  }
+  .rail i:nth-child(3) {
+    animation-delay: 0.16s;
+  }
+  .rail i:nth-child(4) {
+    animation-delay: 0.24s;
+  }
+}
+
+@keyframes fill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
