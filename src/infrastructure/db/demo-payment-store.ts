@@ -14,7 +14,9 @@ export interface DemoPaymentIntent {
   instalmentId?: string;
   amount: bigint;
   currency: string;
-  status: "PENDING" | "SUCCEEDED" | "FAILED";
+  provider?: string;
+  providerPaymentId?: string;
+  status: "CREATED" | "PROCESSING" | "SUCCEEDED" | "FAILED" | "EXPIRED" | "PENDING";
   idempotencyKey?: string;
   createdAt: Date;
 }
@@ -224,6 +226,7 @@ class DemoPaymentStore {
       instalmentId: inst2Id,
       amount: 1500000n,
       currency: "INR",
+      provider: "MOCK_GATEWAY",
       status: "PENDING",
       createdAt: new Date(),
     });
@@ -260,6 +263,7 @@ class DemoPaymentStore {
       instalmentId: instMohit1Id,
       amount: 4000000n,
       currency: "INR",
+      provider: "MOCK_GATEWAY",
       status: "PENDING",
       createdAt: new Date(),
     });
@@ -273,8 +277,10 @@ class DemoPaymentStore {
     instalmentId?: string;
     amount: bigint;
     currency: string;
-    provider: string;
+    provider?: string;
+    status?: "CREATED" | "PROCESSING" | "SUCCEEDED" | "FAILED" | "EXPIRED" | "PENDING";
     idempotencyKey?: string;
+    createdAt?: Date;
   }): DemoPaymentIntent {
     const id = `intent_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const intent: DemoPaymentIntent = {
@@ -284,12 +290,39 @@ class DemoPaymentStore {
       instalmentId: data.instalmentId,
       amount: data.amount,
       currency: data.currency,
-      status: "PENDING",
+      provider: data.provider || "MOCK_GATEWAY",
+      status: data.status || "CREATED",
       idempotencyKey: data.idempotencyKey,
-      createdAt: new Date(),
+      createdAt: data.createdAt || new Date(),
     };
     this.intents.set(data.orderId, intent);
     return intent;
+  }
+
+  findReusableIntent(params: {
+    studentId: string;
+    instalmentId?: string;
+    amount: bigint;
+    provider: string;
+    maxAgeMs?: number;
+  }): DemoPaymentIntent | null {
+    const maxAge = params.maxAgeMs ?? 30 * 60 * 1000;
+    const now = Date.now();
+    for (const intent of this.intents.values()) {
+      const matchInstalment =
+        (intent.instalmentId || undefined) === (params.instalmentId || undefined);
+      if (
+        intent.studentId === params.studentId &&
+        matchInstalment &&
+        intent.amount === params.amount &&
+        (intent.provider || "MOCK_GATEWAY") === params.provider &&
+        (intent.status === "CREATED" || intent.status === "PENDING") &&
+        now - intent.createdAt.getTime() <= maxAge
+      ) {
+        return intent;
+      }
+    }
+    return null;
   }
 
   findPaymentIntent(orderId: string): DemoPaymentIntent | null {
@@ -431,10 +464,17 @@ class DemoPaymentStore {
     return receipt;
   }
 
-  updatePaymentIntentStatus(orderId: string, status: "SUCCEEDED" | "FAILED") {
+  updatePaymentIntentStatus(
+    orderId: string,
+    status: "CREATED" | "PROCESSING" | "SUCCEEDED" | "FAILED" | "EXPIRED" | "PENDING",
+    providerPaymentId?: string
+  ) {
     const intent = this.intents.get(orderId);
     if (intent) {
       intent.status = status;
+      if (providerPaymentId) {
+        intent.providerPaymentId = providerPaymentId;
+      }
     }
   }
 }

@@ -42,6 +42,8 @@ export default function ParentHomePage() {
   const [isCreatingIntent, setIsCreatingIntent] = useState(false);
   const [activeTab, setActiveTab] = useState<"FEES" | "RECEIPTS" | "ATTENDANCE" | "TESTS">("FEES");
 
+  const [actorLinkedStudentId, setActorLinkedStudentId] = useState<string | null>(null);
+
   // Sync tab from URL query param if present
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -52,6 +54,19 @@ export default function ParentHomePage() {
       else if (tabParam === "TESTS") setActiveTab("TESTS");
       else if (tabParam === "FEES") setActiveTab("FEES");
     }
+
+    async function fetchMe() {
+      try {
+        const res = await fetch("/api/auth/me");
+        if (res.ok) {
+          const data = await res.json();
+          if (data.actor?.linkedStudentIds?.length > 0) {
+            setActorLinkedStudentId(data.actor.linkedStudentIds[0]);
+          }
+        }
+      } catch {}
+    }
+    fetchMe();
   }, []);
 
   // Modal accessibility: Escape key listener and body scroll lock
@@ -75,7 +90,8 @@ export default function ParentHomePage() {
 
   const studentData = isIshita
     ? {
-        id: "stu_ishita_demo_id",
+        id: actorLinkedStudentId || "stu_ishita_0587",
+        activeInstalmentId: "inst_ishita_2",
         studentCode: "STU-0587",
         name: "Ishita Sharma",
         batchName: "JEE 2027 Evening",
@@ -194,6 +210,7 @@ export default function ParentHomePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           studentId: studentData.id,
+          instalmentId: (studentData as any).activeInstalmentId,
           amountPaise: amountToPayPaise.toString(),
         }),
       });

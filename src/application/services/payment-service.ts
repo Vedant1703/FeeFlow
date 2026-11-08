@@ -19,14 +19,36 @@ import {
   PaymentWebhookPayload,
   createMockOrder,
 } from "@/infrastructure/adapters/mock-payment-gateway";
-import { deriveInstalmentBalance } from "@/domain/ledger";
+import {
+  deriveInstalmentBalance,
+  deriveStudentLedgerSummary,
+  DomainInstalment,
+  DomainLedgerEntry,
+} from "@/domain/ledger";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
+import {
+  getPaymentProvider,
+  PaymentProvider,
+  RazorpayPaymentProvider,
+  OrderResult,
+} from "@/infrastructure/payments/payment-provider";
+import { recordAuditLog } from "@/application/services/audit-service";
+import { Actor } from "@/application/actor";
 
 export interface CreatePaymentIntentInput {
   studentId: string;
   instalmentId?: string;
   amountPaise: bigint;
   idempotencyKey?: string;
+  actor?: Actor;
+  provider?: "MOCK_GATEWAY" | "RAZORPAY";
+}
+
+export interface VerifyCheckoutInput {
+  orderId: string;
+  paymentId: string;
+  signature: string;
+  actor?: Actor;
 }
 
 export interface WebhookProcessingResult {
@@ -51,47 +73,529 @@ function isPrismaConnectionError(err: any): boolean {
 
 export class PaymentService {
   /**
-   * Creates a payment intent before redirecting to hosted mock checkout.
+   * Helper to validate student and instalment status, and derive current ledger balance.
+   */
+  private async validateAndDeriveOutstanding(
+    studentId: string,
+    instalmentId?: string
+  ): Promise<{ outstandingBalance: bigint; studentName?: string; studentCode?: string }> {
+    try {
+      const student = await prisma.student.findUnique({
+        where: { id: studentId },
+      });
+
+      if (!student) {
+        return this.validateAndDeriveOutstandingDemo(studentId, instalmentId);
+      }
+
+      if (student.status === "WITHDRAWN") {
+        throw new Error("Student admission is withdrawn. Payments cannot be accepted.");
+      }
+
+      if (instalmentId) {
+        const instalment = await prisma.instalment.findUnique({
+          where: { id: instalmentId },
+          include: { feePlan: true },
+        });
+
+        if (!instalment || instalment.feePlan.studentId !== studentId) {
+          throw new Error("Instalment does not belong to the student");
+        }
+
+        if (instalment.status === "PAID") {
+          throw new Error("Instalment is already settled");
+        }
+
+        if (instalment.status === "CANCELLED" || instalment.status === "WAIVED") {
+          throw new Error("Instalment is cancelled or waived");
+        }
+
+        const entries = await prisma.ledgerEntry.findMany({
+          where: { studentId },
+        });
+
+        const domainEntries: DomainLedgerEntry[] = entries.map((e) => ({
+          id: e.id,
+          studentId: e.studentId,
+          instalmentId: e.instalmentId,
+          entryType: e.entryType as any,
+          amount: e.amount,
+          entryDate: e.entryDate,
+          referenceType: e.referenceType,
+          referenceId: e.referenceId,
+          notes: e.notes,
+        }));
+
+        const domainInstalment: DomainInstalment = {
+          id: instalment.id,
+          feePlanId: instalment.feePlanId,
+          sequence: instalment.sequence,
+          dueDate: instalment.dueDate,
+          amount: instalment.amount,
+        };
+
+        const bal = deriveInstalmentBalance(domainInstalment, domainEntries, new Date());
+        return {
+          outstandingBalance: bal.outstandingBalance,
+          studentName: student.name,
+          studentCode: student.studentCode,
+        };
+      } else {
+        const instalments = await prisma.instalment.findMany({
+          where: { feePlan: { studentId } },
+        });
+        const entries = await prisma.ledgerEntry.findMany({
+          where: { studentId },
+        });
+
+        const domainEntries: DomainLedgerEntry[] = entries.map((e) => ({
+          id: e.id,
+          studentId: e.studentId,
+          instalmentId: e.instalmentId,
+          entryType: e.entryType as any,
+          amount: e.amount,
+          entryDate: e.entryDate,
+          referenceType: e.referenceType,
+          referenceId: e.referenceId,
+          notes: e.notes,
+        }));
+
+        const domainInstalments: DomainInstalment[] = instalments.map((i) => ({
+          id: i.id,
+          feePlanId: i.feePlanId,
+          sequence: i.sequence,
+          dueDate: i.dueDate,
+          amount: i.amount,
+        }));
+
+        const summary = deriveStudentLedgerSummary(
+          studentId,
+          domainInstalments,
+          domainEntries,
+          new Date()
+        );
+        return {
+          outstandingBalance: summary.totalOutstanding,
+          studentName: student.name,
+          studentCode: student.studentCode,
+        };
+      }
+    } catch (err: any) {
+      if (isPrismaConnectionError(err)) {
+        return this.validateAndDeriveOutstandingDemo(studentId, instalmentId);
+      }
+      throw err;
+    }
+  }
+
+  private validateAndDeriveOutstandingDemo(
+    studentId: string,
+    instalmentId?: string
+  ): { outstandingBalance: bigint; studentName?: string; studentCode?: string } {
+    if (studentId === "stu_withdrawn") {
+      throw new Error("Student admission is withdrawn. Payments cannot be accepted.");
+    }
+
+    const instalments = demoPaymentStore.getStudentInstalments(studentId);
+    const ledger = demoPaymentStore.getStudentLedger(studentId);
+
+    if (instalmentId) {
+      const instalment = demoPaymentStore.instalments.get(instalmentId);
+      if (!instalment) {
+        throw new Error("Instalment not found");
+      }
+      if (instalment.studentId !== studentId) {
+        throw new Error("Instalment does not belong to the student");
+      }
+      if (instalment.status === "PAID") {
+        throw new Error("Instalment is already settled");
+      }
+      if (instalment.status === "CANCELLED" || instalment.status === "WAIVED") {
+        throw new Error("Instalment is cancelled or waived");
+      }
+
+      const bal = deriveInstalmentBalance(instalment, ledger, new Date());
+      return {
+        outstandingBalance: bal.outstandingBalance,
+        studentName: "Ishita Sharma",
+        studentCode: "STU-0587",
+      };
+    } else {
+      const summary = deriveStudentLedgerSummary(studentId, instalments, ledger, new Date());
+      return {
+        outstandingBalance: summary.totalOutstanding,
+        studentName: "Ishita Sharma",
+        studentCode: "STU-0587",
+      };
+    }
+  }
+
+  /**
+   * Creates a payment intent with strict financial validation and pending intent reuse (< 30 minutes).
    */
   async createIntent(input: CreatePaymentIntentInput) {
     if (input.amountPaise <= 0n) {
       throw new Error("Payment amount must be greater than zero");
     }
 
-    const mockOrder = createMockOrder({
+    if (!Number.isSafeInteger(Number(input.amountPaise))) {
+      throw new Error("Payment amount exceeds safe integer limit");
+    }
+
+    // RBAC verification: If Parent, must be linked & consented
+    if (input.actor && input.actor.role === "PARENT") {
+      if (!input.actor.linkedStudentIds.includes(input.studentId)) {
+        throw new Error("Access denied: student not linked");
+      }
+      if (!input.actor.consentedStudentIds.includes(input.studentId)) {
+        throw new Error("Access denied: DPDP consent required");
+      }
+    }
+
+    // Validate student, instalment, and calculate live ledger balance
+    const { outstandingBalance } = await this.validateAndDeriveOutstanding(
+      input.studentId,
+      input.instalmentId
+    );
+
+    if (outstandingBalance === 0n) {
+      throw new Error("Instalment is already settled");
+    }
+
+    if (input.amountPaise > outstandingBalance) {
+      throw new Error(
+        `Payment amount exceeds current outstanding balance of ₹${(Number(outstandingBalance) / 100).toLocaleString("en-IN")}`
+      );
+    }
+
+    // Minimum partial payment rule:
+    // If outstanding > ₹1,000, must pay at least ₹1,000.
+    // If remaining < ₹1,000, must pay exact remaining.
+    if (outstandingBalance > 100000n) {
+      if (input.amountPaise < 100000n) {
+        throw new Error("Minimum payment amount is ₹1,000");
+      }
+    } else {
+      if (input.amountPaise !== outstandingBalance) {
+        throw new Error(
+          `When outstanding balance is less than ₹1,000, the exact remaining balance must be paid`
+        );
+      }
+    }
+
+    // Resolve provider
+    const provider = getPaymentProvider(input.provider);
+
+    // Check for pending intent reuse (< 30 minutes, exact student, instalment, amount, provider)
+    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+
+    try {
+      const existingIntent = await prisma.paymentIntent.findFirst({
+        where: {
+          studentId: input.studentId,
+          instalmentId: input.instalmentId || null,
+          amount: input.amountPaise,
+          provider: provider.providerName,
+          status: "CREATED",
+          createdAt: { gte: thirtyMinutesAgo },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (existingIntent) {
+        const ageMinutes = Math.floor(
+          (Date.now() - existingIntent.createdAt.getTime()) / 60000
+        );
+
+        await recordAuditLog({
+          action: "PAYMENT_INTENT_REUSED",
+          entityType: "PaymentIntent",
+          entityId: existingIntent.id,
+          actorId: input.actor?.userId,
+          actorEmail: input.actor?.email,
+          actorRole: input.actor?.role,
+          metadata: {
+            intentId: existingIntent.id,
+            orderId: existingIntent.orderId,
+            ageMinutes,
+          },
+        });
+
+        const keyId =
+          provider instanceof RazorpayPaymentProvider ? provider.getPublicKeyId() : undefined;
+
+        return {
+          ...existingIntent,
+          keyId,
+          isReused: true,
+        };
+      }
+    } catch (err: any) {
+      if (!isPrismaConnectionError(err)) {
+        throw err;
+      }
+      // In demo/test mode, check in-memory store
+      const existing = demoPaymentStore.findReusableIntent({
+        studentId: input.studentId,
+        instalmentId: input.instalmentId,
+        amount: input.amountPaise,
+        provider: provider.providerName,
+      });
+
+      if (existing) {
+        const ageMinutes = Math.floor(
+          (Date.now() - existing.createdAt.getTime()) / 60000
+        );
+
+        await recordAuditLog({
+          action: "PAYMENT_INTENT_REUSED",
+          entityType: "PaymentIntent",
+          entityId: existing.id,
+          actorId: input.actor?.userId,
+          actorEmail: input.actor?.email,
+          actorRole: input.actor?.role,
+          metadata: {
+            intentId: existing.id,
+            orderId: existing.orderId,
+            ageMinutes,
+          },
+        });
+
+        const keyId =
+          provider instanceof RazorpayPaymentProvider ? provider.getPublicKeyId() : undefined;
+
+        return {
+          ...existing,
+          provider: existing.provider || provider.providerName,
+          keyId,
+          isReused: true,
+        };
+      }
+    }
+
+    // Call provider to create new order
+    const orderResult = await provider.createOrder({
       studentId: input.studentId,
       instalmentId: input.instalmentId,
       amountPaise: input.amountPaise,
+      parentId: input.actor?.userId,
     });
 
     try {
       const intent = await prisma.paymentIntent.create({
         data: {
-          orderId: mockOrder.orderId,
+          orderId: orderResult.orderId,
           studentId: input.studentId,
           instalmentId: input.instalmentId,
           amount: input.amountPaise,
           currency: "INR",
-          provider: "MOCK_GATEWAY",
+          provider: provider.providerName,
+          status: "CREATED",
           idempotencyKey: input.idempotencyKey,
         },
       });
 
-      return intent;
+      await recordAuditLog({
+        action: "PAYMENT_ORDER_CREATED",
+        entityType: "PaymentIntent",
+        entityId: intent.id,
+        actorId: input.actor?.userId,
+        actorEmail: input.actor?.email,
+        actorRole: input.actor?.role,
+        metadata: {
+          orderId: intent.orderId,
+          intentId: intent.id,
+          studentId: intent.studentId,
+          amountPaise: intent.amount.toString(),
+          provider: intent.provider,
+        },
+      });
+
+      return {
+        ...intent,
+        keyId: orderResult.keyId,
+        isReused: false,
+      };
     } catch (err: any) {
       if (isPrismaConnectionError(err)) {
-        return demoPaymentStore.createPaymentIntent({
-          orderId: mockOrder.orderId,
+        const demoIntent = demoPaymentStore.createPaymentIntent({
+          orderId: orderResult.orderId,
           studentId: input.studentId,
           instalmentId: input.instalmentId,
           amount: input.amountPaise,
           currency: "INR",
-          provider: "MOCK_GATEWAY",
+          provider: provider.providerName,
+          status: "CREATED",
           idempotencyKey: input.idempotencyKey,
         });
+
+        await recordAuditLog({
+          action: "PAYMENT_ORDER_CREATED",
+          entityType: "PaymentIntent",
+          entityId: demoIntent.id,
+          actorId: input.actor?.userId,
+          actorEmail: input.actor?.email,
+          actorRole: input.actor?.role,
+          metadata: {
+            orderId: demoIntent.orderId,
+            intentId: demoIntent.id,
+            studentId: demoIntent.studentId,
+            amountPaise: demoIntent.amount.toString(),
+            provider: demoIntent.provider,
+          },
+        });
+
+        return {
+          ...demoIntent,
+          keyId: orderResult.keyId,
+          isReused: false,
+        };
       }
       throw err;
     }
+  }
+
+  /**
+   * Retrieves intent details by orderId for checkout rendering.
+   */
+  async getIntent(orderId: string) {
+    try {
+      const intent = await prisma.paymentIntent.findUnique({
+        where: { orderId },
+      });
+      if (intent) {
+        let studentName = "Ishita Sharma";
+        let studentCode = "STU-0587";
+        try {
+          const student = await prisma.student.findUnique({ where: { id: intent.studentId } });
+          if (student) {
+            studentName = student.name;
+            studentCode = student.studentCode;
+          }
+        } catch {}
+        const provider = getPaymentProvider(intent.provider as any);
+        const keyId =
+          provider instanceof RazorpayPaymentProvider ? provider.getPublicKeyId() : undefined;
+        return {
+          ...intent,
+          studentName,
+          studentCode,
+          keyId,
+        };
+      }
+    } catch {}
+
+    const demo = demoPaymentStore.findPaymentIntent(orderId);
+    if (demo) {
+      const provider = getPaymentProvider((demo.provider || "MOCK_GATEWAY") as any);
+      const keyId =
+        provider instanceof RazorpayPaymentProvider ? provider.getPublicKeyId() : undefined;
+      return {
+        ...demo,
+        studentName: "Ishita Sharma",
+        studentCode: "STU-0587",
+        keyId,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Verifies Razorpay post-checkout signature and sets intent to PROCESSING.
+   * HARD INVARIANT: Zero ledger mutation, zero payments created, zero receipts issued.
+   */
+  async verifyCheckoutSignature(input: VerifyCheckoutInput): Promise<{
+    success: boolean;
+    status: string;
+    orderId?: string;
+    error?: string;
+  }> {
+    const { orderId, paymentId, signature, actor } = input;
+
+    // 1. Locate payment intent
+    let intent: any = null;
+    try {
+      intent = await prisma.paymentIntent.findUnique({
+        where: { orderId },
+      });
+    } catch (err: any) {
+      if (isPrismaConnectionError(err)) {
+        intent = demoPaymentStore.findPaymentIntent(orderId);
+      } else {
+        throw err;
+      }
+    }
+
+    if (!intent) {
+      intent = demoPaymentStore.findPaymentIntent(orderId);
+    }
+
+    if (!intent) {
+      await recordAuditLog({
+        action: "CHECKOUT_SIGNATURE_FAILED",
+        entityType: "PaymentIntent",
+        entityId: orderId,
+        metadata: { orderId, reason: "Payment intent not found" },
+      });
+      return { success: false, status: "REJECTED", error: "Payment intent not found" };
+    }
+
+    // 2. Authorization check
+    if (actor && actor.role === "PARENT") {
+      if (!actor.linkedStudentIds.includes(intent.studentId)) {
+        return { success: false, status: "REJECTED", error: "Access denied: student not linked" };
+      }
+    }
+
+    // 3. Signature verification via provider
+    const provider = getPaymentProvider(intent.provider as any);
+    const isValid = provider.verifyCheckoutSignature({
+      orderId,
+      paymentId,
+      signature,
+    });
+
+    if (!isValid) {
+      await recordAuditLog({
+        action: "CHECKOUT_SIGNATURE_FAILED",
+        entityType: "PaymentIntent",
+        entityId: intent.id,
+        metadata: { orderId, reason: "Invalid payment signature" },
+      });
+      return { success: false, status: "REJECTED", error: "Invalid payment signature" };
+    }
+
+    // 4. Signature verified: Update intent status to PROCESSING
+    try {
+      await prisma.paymentIntent.update({
+        where: { orderId },
+        data: {
+          status: "PROCESSING",
+          idempotencyKey: paymentId,
+        },
+      });
+    } catch (err: any) {
+      if (isPrismaConnectionError(err)) {
+        demoPaymentStore.updatePaymentIntentStatus(orderId, "PROCESSING", paymentId);
+      }
+    }
+    demoPaymentStore.updatePaymentIntentStatus(orderId, "PROCESSING", paymentId);
+
+    await recordAuditLog({
+      action: "CHECKOUT_SIGNATURE_VERIFIED",
+      entityType: "PaymentIntent",
+      entityId: intent.id,
+      actorId: actor?.userId,
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      metadata: { orderId, paymentId, intentId: intent.id },
+    });
+
+    return {
+      success: true,
+      status: "pending",
+      orderId: intent.orderId,
+    };
   }
 
   /**

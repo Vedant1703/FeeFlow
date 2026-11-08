@@ -125,21 +125,31 @@ function PaymentStatusContent() {
 
             <div className="space-y-1.5">
               <h1 className="text-xl font-bold tracking-tight text-ink">
-                Confirming Payment...
+                Payment Confirmation Pending
               </h1>
-              <p className="text-xs text-ink-2">
-                We are awaiting authoritative signed capture verification from your bank or UPI gateway.
+              <p className="text-xs text-ok font-semibold">
+                Payment received. Final receipt will be generated once verified by bank.
+              </p>
+              <p className="text-[11px] text-ink-3">
+                Processing typically completes within seconds to a few minutes.
               </p>
             </div>
 
-            <div className="p-3.5 rounded-panel bg-paper border border-dashed border-info/40 text-xs text-ink-2 space-y-1.5 text-left">
-              <div className="font-semibold text-ink flex items-center gap-1.5">
-                <ShieldCheck className="w-4 h-4 text-info" />
-                <span>Zero Client-Trust Principle</span>
+            <div className="p-3.5 rounded-panel bg-paper border border-line text-xs text-ink-2 space-y-2 text-left">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-ink-3">Order Reference:</span>
+                <span className="font-mono text-ink font-semibold">{orderId}</span>
               </div>
-              <p className="text-[11px] text-ink-3">
-                Browser redirects never mark an instalment paid. Only a signature-verified webhook creates financial ledger records. Do not make a second payment while this is confirming.
-              </p>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-ink-3">Support Contact:</span>
+                <span className="text-ink font-medium">accounts@companya.ac.in | +91 141 2345678</span>
+              </div>
+              <div className="pt-2 border-t border-line text-[11px] text-ink-3 flex items-start gap-1.5">
+                <ShieldCheck className="w-4 h-4 text-info shrink-0 mt-0.5" />
+                <span>
+                  <strong>Zero Client-Trust Principle:</strong> Browser redirects never mark an instalment paid. Only a signature-verified bank webhook updates the fee ledger and issues official tax invoices.
+                </span>
+              </div>
             </div>
 
             <div className="space-y-2 pt-2">
