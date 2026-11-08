@@ -10,7 +10,14 @@
  * - Verified mobile identities are normalized to Indian E.164 (+91XXXXXXXXXX).
  */
 
+import dns from "dns";
 import { normalizeIndianPhoneNumber } from "../otp-service";
+
+// Ensure Node.js prioritizes IPv4 resolution for outbound provider API requests
+// This ensures server-to-server requests connect via IPv4 matching the configured whitelisted IPv4 addresses.
+if (typeof dns?.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 export interface Msg91VerifyAccessTokenResponse {
   type: "success" | "error";
