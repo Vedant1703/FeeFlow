@@ -102,10 +102,22 @@ export class Msg91WidgetAdapter {
 
       // MSG91 returns 200 even on some validation failures; check data.type strictly
       if (!response.ok || data.type !== "success") {
+        const codeStr = data.code !== undefined ? String(data.code) : "";
+        console.error(
+          `[Msg91WidgetAdapter] Verification rejected by MSG91: status=${response.status}, code=${codeStr || "none"}, message=${data.message || "none"}`
+        );
+
+        let errorDetail = data.message || `MSG91 verification rejected token (type: ${data.type || "unknown"})`;
+        if (codeStr === "418") {
+          errorDetail = "MSG91 API Security Rejection (Code 418: Server IP not whitelisted). Please whitelist this server's public IP in MSG91 dashboard under Authkey API Security, or disable IP restriction.";
+        } else if (codeStr === "201") {
+          errorDetail = "MSG91 AuthenticationFailure (Code 201: Invalid Authkey). Please verify MSG91_AUTHKEY in your environment settings.";
+        }
+
         return {
           success: false,
           statusCode: response.status,
-          error: data.message || `MSG91 verification rejected token (type: ${data.type || "unknown"})`,
+          error: errorDetail,
         };
       }
 

@@ -87,6 +87,10 @@ function ParentLoginContent() {
   // 60-second Resend Cooldown Timer
   const [cooldown, setCooldown] = useState(0);
 
+  // References for submission locking and cached access tokens
+  const verifiedAccessTokenRef = React.useRef<string | null>(null);
+  const isSubmittingRef = React.useRef(false);
+
   // Safely initialize the MSG91 Web SDK when credentials are configured
   useEffect(() => {
     if (!isWidgetConfigured) {
@@ -115,8 +119,23 @@ function ParentLoginContent() {
               widgetId,
               tokenAuth: widgetToken,
               exposeMethods: true,
-              success: () => {},
-              failure: () => {},
+              success: (data: any) => {
+                const token =
+                  typeof data === "string"
+                    ? data
+                    : data?.["access-token"] ||
+                      data?.accessToken ||
+                      data?.token ||
+                      (data?.message && typeof data.message === "string" && data.message.startsWith("eyJ")
+                        ? data.message
+                        : null);
+                if (token && typeof token === "string") {
+                  verifiedAccessTokenRef.current = token;
+                }
+              },
+              failure: (error: any) => {
+                console.warn("[MSG91 Widget] Global failure callback:", error);
+              },
             };
             window.initSendOTP(configuration);
             setWidgetStatus("ready");
@@ -291,6 +310,7 @@ function ParentLoginContent() {
           studentName: studentCode === "NEW" ? studentName.trim() : undefined,
           relationship,
           preferredLanguage: language,
+          skipOtp: isWidgetConfigured,
         }),
       });
 
@@ -388,6 +408,8 @@ function ParentLoginContent() {
   // Handle OTP Verification & Session Issuance
   const handleVerifyOtp = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     setError(null);
     setLoading(true);
 
@@ -399,6 +421,29 @@ function ParentLoginContent() {
             return reject(new Error("MSG91 verifyOtp method not available on window."));
           }
 
+          const completeBackendVerification = async (tokenToVerify: string) => {
+            const res = await fetch("/api/auth/otp/verify-widget", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                challengeId,
+                reqId,
+                accessToken: tokenToVerify,
+              }),
+            });
+
+            const data = await res.json();
+            if (!res.ok) {
+              throw new Error(data.error || "Failed to verify access token with server");
+            }
+
+            if (data.requiresConsent) {
+              router.push("/parent/consent");
+            } else {
+              router.push("/parent");
+            }
+          };
+
           window.verifyOtp(
             otp.trim(),
             async (verifyData: any) => {
@@ -409,41 +454,39 @@ function ParentLoginContent() {
                     : verifyData?.["access-token"] ||
                       verifyData?.accessToken ||
                       verifyData?.token ||
-                      verifyData?.message;
+                      (verifyData?.message && typeof verifyData.message === "string" && verifyData.message.startsWith("eyJ")
+                        ? verifyData.message
+                        : null) ||
+                      verifiedAccessTokenRef.current;
 
                 if (!accessToken || typeof accessToken !== "string") {
                   return reject(new Error("MSG91 verification did not return an access token."));
                 }
 
-                // Call FeeFlow backend to verify directly with MSG91 verifyAccessToken API
-                const res = await fetch("/api/auth/otp/verify-widget", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    challengeId,
-                    reqId,
-                    accessToken,
-                  }),
-                });
-
-                const data = await res.json();
-                if (!res.ok) {
-                  return reject(new Error(data.error || "Failed to verify access token with server"));
-                }
-
-                if (data.requiresConsent) {
-                  router.push("/parent/consent");
-                } else {
-                  router.push("/parent");
-                }
+                verifiedAccessTokenRef.current = accessToken;
+                await completeBackendVerification(accessToken);
                 resolve();
               } catch (innerErr: any) {
                 reject(innerErr);
               }
             },
-            (failureData: any) => {
-              const msg = failureData?.message || failureData?.error || "Invalid OTP code entered.";
-              reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+            async (failureData: any) => {
+              try {
+                const msg = failureData?.message || failureData?.error || "Invalid OTP code entered.";
+                const code = failureData?.code;
+                // If MSG91 reports OTP already verified (code 703 or regex match) and we have a cached access token:
+                if (
+                  (code === 703 || /already verif/i.test(String(msg))) &&
+                  verifiedAccessTokenRef.current
+                ) {
+                  await completeBackendVerification(verifiedAccessTokenRef.current);
+                  resolve();
+                  return;
+                }
+                reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+              } catch (innerErr: any) {
+                reject(innerErr);
+              }
             },
             reqId
           );
@@ -470,6 +513,7 @@ function ParentLoginContent() {
     } catch (err: any) {
       setError(err.message);
     } finally {
+      isSubmittingRef.current = false;
       setLoading(false);
     }
   };
@@ -925,7 +969,7 @@ function ParentLoginContent() {
 
               <button
                 type="submit"
-                disabled={loading || otp.length !== 6}
+                disabled={loading || isSubmittingRef.current || otp.length !== 6}
                 className="w-full h-[52px] rounded-input bg-teal hover:bg-teal-d text-white font-semibold text-sm transition-colors flex items-center justify-center gap-2 shadow-xs disabled:opacity-50"
               >
                 {loading ? (

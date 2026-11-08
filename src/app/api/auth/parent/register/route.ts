@@ -11,6 +11,7 @@ const RegisterParentSchema = z.object({
   studentName: z.string().optional(),
   relationship: z.string().default("Guardian"),
   preferredLanguage: z.enum(["en", "hi"]).default("en"),
+  skipOtp: z.boolean().optional().default(false),
 });
 
 export async function POST(req: Request) {
@@ -30,7 +31,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const { name, phone: rawPhone, studentCode, studentName, relationship, preferredLanguage } =
+    const { name, phone: rawPhone, studentCode, studentName, relationship, preferredLanguage, skipOtp } =
       parseResult.data;
 
     // Normalize phone number
@@ -165,7 +166,21 @@ export async function POST(req: Request) {
       ],
     });
 
-    // 4. Request cryptographically secure OTP for the new parent
+    // 4. In widget authentication mode, skip local OTP generation to avoid redundant dispatch and cooldown conflicts
+    if (skipOtp) {
+      return NextResponse.json({
+        success: true,
+        message: `Parent registered successfully. Please proceed with verification.`,
+        parent: {
+          id: parent.id,
+          name: parent.name,
+          phone: parent.phone,
+        },
+        skipOtp: true,
+      });
+    }
+
+    // 5. Request cryptographically secure OTP for standard / mock authentication mode
     const otpRes = await otpService.requestOtp(cleanPhone);
     if (!otpRes.success) {
       return NextResponse.json(

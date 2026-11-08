@@ -151,11 +151,14 @@ export async function POST(req: Request) {
       students: studentList,
     });
 
+    const isHttps =
+      req.headers.get("x-forwarded-proto") === "https" || process.env.NODE_ENV === "production";
+
     response.cookies.set({
       name: SESSION_COOKIE_NAME,
       value: token,
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: isHttps,
       path: "/",
       maxAge: 7 * 24 * 60 * 60, // 7 days
       sameSite: "lax",
@@ -169,3 +172,4 @@ export async function POST(req: Request) {
     );
   }
 }
+
