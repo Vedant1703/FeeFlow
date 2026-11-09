@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { paymentService } from "@/application/services/payment-service";
+import { refundService } from "@/application/services/refund-service";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
 import { Actor } from "@/application/actor";
 import { deriveInstalmentBalance } from "@/domain/ledger";
 
-describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 Scenarios)", () => {
+describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (17 Scenarios)", () => {
   // Actors
   const directorActor: Actor = {
     userId: "usr_director_arvind",
@@ -149,6 +150,21 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       matchStatus: "UNMATCHED",
     });
 
+    demoPaymentStore.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "prov_multi_50k",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "prov_multi_50k",
+        amountPaise: 5000000,
+        currency: "INR",
+        verifiedReceipt: true,
+      }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "UNMATCHED",
+    });
+
     // Mohit inst 1 is ₹40,000 due; inst 2 is ₹40,000 due
     // Allocate ₹40,000 to inst 1 (fully settles it) and ₹10,000 to inst 2
     demoPaymentStore.reminders.push({
@@ -247,7 +263,11 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       provider: "MOCK_GATEWAY",
       providerEventId: "prov_big_ishita",
       eventType: "payment.captured",
-      payloadJson: JSON.stringify({ paymentId: "prov_big_ishita" }),
+      payloadJson: JSON.stringify({
+        paymentId: "prov_big_ishita",
+        amountPaise: 2500000,
+        currency: "INR",
+      }),
       signatureVerified: true,
       processed: true,
       processingStatus: "ALLOCATED",
@@ -401,7 +421,11 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       provider: "RAZORPAY",
       providerEventId: "pay_rzp_ref_deduct",
       eventType: "payment.captured",
-      payloadJson: JSON.stringify({ paymentId: "pay_rzp_ref_deduct" }),
+      payloadJson: JSON.stringify({
+        paymentId: "pay_rzp_ref_deduct",
+        amountPaise: 3000000,
+        currency: "INR",
+      }),
       signatureVerified: true,
       processed: true,
       processingStatus: "ALLOCATED",
@@ -630,7 +654,11 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       provider: "RAZORPAY",
       providerEventId: "pay_tampered_rzp_88",
       eventType: "payment.captured",
-      payloadJson: JSON.stringify({ paymentId: "pay_tampered_rzp_88" }),
+      payloadJson: JSON.stringify({
+        paymentId: "pay_tampered_rzp_88",
+        amountPaise: 1000000,
+        currency: "INR",
+      }),
       signatureVerified: false, // Invalid / unverified signature
       processed: false,
     });
@@ -645,7 +673,217 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       })
     ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
 
-    // 3. Gateway payment with valid verified ProviderEvent
+    // 3. Gateway payment with mismatched amount in event payload
+    const mismatchAmtPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-MISMATCH-AMT",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_mismatch_amt_66",
+      amount: 2500000n, // Payment is ₹25,000
+      unallocatedAmount: 2500000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Mismatched Payer",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_mismatch_amt_66",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "pay_mismatch_amt_66",
+        amountPaise: 1500000, // Event payload is only ₹15,000
+        currency: "INR",
+      }),
+      signatureVerified: true,
+      processed: true,
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: mismatchAmtPay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating payment with mismatched event amount",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
+
+    // 4. Gateway payment with mismatched currency in event payload
+    const mismatchCurrPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-MISMATCH-CURR",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_mismatch_curr_55",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "USD Payer",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_mismatch_curr_55",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "pay_mismatch_curr_55",
+        amountPaise: 1000000,
+        currency: "USD", // Mismatched currency
+      }),
+      signatureVerified: true,
+      processed: true,
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: mismatchCurrPay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating payment with mismatched event currency",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
+
+    // 5. Gateway payment with non-captured event (e.g. payment.authorized)
+    const authOnlyPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-AUTH-ONLY",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_auth_only_44",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Auth Only",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_auth_only_44",
+      eventType: "payment.authorized", // NOT payment.captured
+      payloadJson: JSON.stringify({
+        paymentId: "pay_auth_only_44",
+        amountPaise: 1000000,
+        currency: "INR",
+      }),
+      signatureVerified: true,
+      processed: true,
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: authOnlyPay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating payment with only authorized event",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
+
+    // 6. Gateway payment with unchecked/arbitrary reconcile_ ID prefix that does not match
+    const fakeReconcilePay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-FAKE-RECONCILE",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_fake_rec_33",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Fake Reconcile",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "reconcile_arbitrary_unrelated_id",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "pay_unrelated_id",
+        amountPaise: 1000000,
+        currency: "INR",
+      }),
+      signatureVerified: false,
+      processed: true,
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: fakeReconcilePay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating payment with arbitrary reconcile prefix",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
+
+    // 7. Bank transfer with ONLY a manual UTR string in payerDetails and NO verified receipt evidence
+    const manualUtrBankPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-MANUAL-UTR-ONLY",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "bank_manual_utr_22",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "NEFT",
+      payerDetails: "Mohit Gurjar / PUNB0123456 / UTR-9988776655", // Only manual string
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: manualUtrBankPay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating bank transfer with only manual UTR string",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/bank transfer capture lacks verified receipt evidence/i);
+
+    // 8. Bank transfer WITH verified receipt / statement intake evidence
+    const verifiedBankPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-VERIFIED-BANK",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "bank_verified_stmt_11",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "NEFT",
+      payerDetails: "Mohit Gurjar / PUNB0123456 / UTR-55443322",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "bank_verified_stmt_11",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "bank_verified_stmt_11",
+        amountPaise: 1000000,
+        currency: "INR",
+        verifiedReceipt: true,
+      }),
+      signatureVerified: true,
+      processed: true,
+    });
+
+    const bankResult = await paymentService.allocatePayment({
+      paymentId: verifiedBankPay.id,
+      studentId: "stu_mohit_0219",
+      allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+      reason: "Legitimate investigated NEFT payment with verified statement intake",
+      actor: accountsActorMansarovar,
+    });
+    expect(bankResult.success).toBe(true);
+    expect(bankResult.totalAllocatedPaise).toBe(500000n);
+
+    // 9. Valid gateway webhook capture with exact matching provenance
     const validGatewayPay = demoPaymentStore.recordPayment({
       paymentReference: "PAY-VALID-GATEWAY",
       provider: "RAZORPAY",
@@ -663,7 +901,11 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       provider: "RAZORPAY",
       providerEventId: "pay_valid_rzp_77",
       eventType: "payment.captured",
-      payloadJson: JSON.stringify({ paymentId: "pay_valid_rzp_77" }),
+      payloadJson: JSON.stringify({
+        paymentId: "pay_valid_rzp_77",
+        amountPaise: 1000000,
+        currency: "INR",
+      }),
       signatureVerified: true,
       processed: true,
       processingStatus: "ALLOCATED",
@@ -679,29 +921,43 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
     expect(validResult.success).toBe(true);
     expect(validResult.totalAllocatedPaise).toBe(500000n);
 
-    // 4. Legitimate investigated bank transfer (NEFT) with UTR provenance
-    const neftBankPay = demoPaymentStore.recordPayment({
-      paymentReference: "PAY-NEFT-BANK-55",
-      provider: "MOCK_GATEWAY",
-      providerPaymentId: "bank_neft_ref_55",
+    // 10. Valid server-side reconciliation matching exact payment ID, amount, and currency
+    const reconciledPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-RECONCILED-SERVER",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_reconciled_rzp_00",
       amount: 1000000n,
       unallocatedAmount: 1000000n,
       paymentDate: new Date(),
-      method: "NEFT",
-      payerDetails: "Mohit Gurjar / PUNB0123456 / UTR-55443322",
+      method: "Netbanking",
+      payerDetails: "Reconciled Payer",
       status: "CAPTURED",
       matchStatus: "UNMATCHED",
     });
 
-    const bankResult = await paymentService.allocatePayment({
-      paymentId: neftBankPay.id,
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "reconcile_pay_reconciled_rzp_00",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "pay_reconciled_rzp_00",
+        amountPaise: 1000000,
+        currency: "INR",
+      }),
+      signatureVerified: false,
+      processed: true,
+      processingStatus: "RECONCILED",
+    });
+
+    const recResult = await paymentService.allocatePayment({
+      paymentId: reconciledPay.id,
       studentId: "stu_mohit_0219",
       allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
-      reason: "Legitimate investigated NEFT payment with banking provenance",
+      reason: "Server reconciled capture allocation",
       actor: accountsActorMansarovar,
     });
-    expect(bankResult.success).toBe(true);
-    expect(bankResult.totalAllocatedPaise).toBe(500000n);
+    expect(recResult.success).toBe(true);
+    expect(recResult.totalAllocatedPaise).toBe(500000n);
   });
 
   // --------------------------------------------------------------------------
@@ -721,6 +977,19 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       payerDetails: "Mohit Gurjar / UTR-PREP-20K",
       status: "CAPTURED",
       matchStatus: "UNMATCHED",
+    });
+    demoPaymentStore.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "prov_prep_20k",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "prov_prep_20k",
+        amountPaise: 2000000,
+        currency: "INR",
+        verifiedReceipt: true,
+      }),
+      signatureVerified: true,
+      processed: true,
     });
     await paymentService.allocatePayment({
       paymentId: prepPay.id,
@@ -750,6 +1019,19 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       status: "CAPTURED",
       matchStatus: "UNMATCHED",
     });
+    demoPaymentStore.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "prov_conc_a",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "prov_conc_a",
+        amountPaise: 1500000,
+        currency: "INR",
+        verifiedReceipt: true,
+      }),
+      signatureVerified: true,
+      processed: true,
+    });
 
     const payB = demoPaymentStore.recordPayment({
       paymentReference: "PAY-CONC-B",
@@ -762,6 +1044,19 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       payerDetails: "Mohit Gurjar / UTR-CONC-B",
       status: "CAPTURED",
       matchStatus: "UNMATCHED",
+    });
+    demoPaymentStore.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "prov_conc_b",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "prov_conc_b",
+        amountPaise: 1500000,
+        currency: "INR",
+        verifiedReceipt: true,
+      }),
+      signatureVerified: true,
+      processed: true,
     });
 
     // Fire allocations simultaneously targeting the same instalment
@@ -820,7 +1115,11 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       provider: "RAZORPAY",
       providerEventId: "pay_rzp_consistency_1",
       eventType: "payment.captured",
-      payloadJson: JSON.stringify({ paymentId: "pay_rzp_consistency_1" }),
+      payloadJson: JSON.stringify({
+        paymentId: "pay_rzp_consistency_1",
+        amountPaise: 4000000,
+        currency: "INR",
+      }),
       signatureVerified: true,
       processed: true,
       processingStatus: "ALLOCATED",
@@ -943,5 +1242,93 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 
       (process.env as any).NODE_ENV = originalNodeEnv;
       process.env.APP_ENV = originalAppEnv;
     }
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 17: Concurrent refund and allocation attempts against the same payment
+  // --------------------------------------------------------------------------
+  it("Scenario 17: concurrent refund and allocation attempts against same payment serialize and prevent negative balance", async () => {
+    // 1. Seed ₹30,000 captured payment with verified capture evidence
+    const payment = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-CONC-REF-ALLOC",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_conc_ref_alloc",
+      amount: 3000000n, // ₹30,000
+      unallocatedAmount: 3000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Mohit Gurjar",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_conc_ref_alloc",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "pay_conc_ref_alloc",
+        amountPaise: 3000000,
+        currency: "INR",
+      }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "ALLOCATED",
+    });
+
+    // 2. Create refund item of ₹20,000 for student
+    const refund = demoPaymentStore.createRefund({
+      withdrawalId: "wd_conc_ref_alloc",
+      studentId: "stu_mohit_0219",
+      totalApprovedAmount: 2000000n,
+      status: "PENDING_EXECUTION",
+    });
+
+    const refundItem = demoPaymentStore.createRefundItem({
+      refundId: refund.id,
+      paymentId: payment.id,
+      amount: 2000000n, // ₹20,000
+      status: "PENDING",
+    });
+
+    // 3. Concurrently trigger allocation of ₹20,000 and refund execution of ₹20,000
+    // Combined requested funds: ₹20,000 + ₹20,000 = ₹40,000 > ₹30,000
+    const allocPromise = paymentService.allocatePayment({
+      paymentId: payment.id,
+      studentId: "stu_mohit_0219",
+      allocations: [
+        {
+          instalmentId: "inst_mohit_1",
+          amountPaise: 2000000n, // ₹20,000
+        },
+      ],
+      reason: "Concurrent allocation attempt",
+      actor: accountsActorMansarovar,
+    });
+
+    const refundPromise = refundService.executeRefundItem({
+      refundItemId: refundItem.id,
+      actor: directorActor,
+    });
+
+    const results = await Promise.allSettled([allocPromise, refundPromise]);
+
+    // 4. Verify serialization: exactly one succeeds, one fails with "exceeds available balance" or "exceeds remaining refundable amount"
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    const rejectionReason = (rejected[0] as PromiseRejectedResult).reason?.message || "";
+    const matchedExpectedError =
+      /exceeds available/i.test(rejectionReason) ||
+      /exceeds remaining refundable/i.test(rejectionReason);
+    expect(matchedExpectedError).toBe(true);
+
+    // 5. Resulting balance is exactly ₹10,000 (1000000n), never negative or over-allocated
+    const updatedPayment = demoPaymentStore.findPaymentById(payment.id)!;
+    expect(updatedPayment.unallocatedAmount).toBe(1000000n); // exactly ₹10,000 remaining
+    expect(updatedPayment.unallocatedAmount).toBeGreaterThanOrEqual(0n);
   });
 });

@@ -1977,49 +1977,130 @@ export class PaymentService {
 
   /**
    * Helper to verify whether a payment has authoritative, verified capture evidence.
-   * Rejects unverified webhook events or phantom payment records.
-   * Preserves legitimate manually investigated bank payments with verified provenance.
+   * Enforces strict provenance:
+   * 1. Gateway evidence must match exact provider payment ID, provider, payment.captured event, amount, and currency.
+   * 2. Rejects arbitrary signature-verified events or unchecked reconcile_ ID prefixes.
+   * 3. Confirms bank-transfer capture evidence represents verified receipt, not merely a manually entered UTR.
    */
   private async verifyAuthoritativeCapture(payment: any, tx?: any): Promise<boolean> {
     if (payment.status !== "CAPTURED") return false;
 
+    const client = tx || prisma;
+
     // Check provider event intake evidence
     try {
-      const client = tx || prisma;
       const providerEvents = await client.providerEvent.findMany({
         where: {
           provider: payment.provider,
           OR: [
             { providerEventId: payment.providerPaymentId },
+            { providerEventId: `reconcile_${payment.providerPaymentId}` },
             { payloadJson: { contains: payment.providerPaymentId } },
             ...(payment.orderId ? [{ payloadJson: { contains: payment.orderId } }] : []),
           ],
         },
       });
 
-      if (providerEvents.length > 0) {
-        // Must have at least one verified event or trusted server reconciliation
-        const hasVerified = providerEvents.some(
-          (e: any) =>
-            e.signatureVerified === true ||
-            (e.providerEventId && e.providerEventId.startsWith("reconcile_"))
-        );
-        return hasVerified;
+      for (const event of providerEvents) {
+        if (event.provider !== payment.provider) continue;
+
+        const isVerifiedWebhook = event.signatureVerified === true;
+        const isReconciled =
+          event.providerEventId === `reconcile_${payment.providerPaymentId}` ||
+          (event.providerEventId?.startsWith("reconcile_") && event.payloadJson.includes(payment.providerPaymentId));
+
+        if (!isVerifiedWebhook && !isReconciled) continue;
+
+        try {
+          const parsed = JSON.parse(event.payloadJson);
+
+          // 1. Event Type must be payment.captured
+          const eventType = event.eventType || parsed.event || parsed.eventType;
+          if (eventType !== "payment.captured") continue;
+
+          // 2. Exact Provider Payment ID check
+          const eventPaymentId =
+            parsed.payload?.payment?.entity?.id ||
+            parsed.providerPaymentId ||
+            parsed.paymentId ||
+            parsed.id;
+          if (eventPaymentId && eventPaymentId !== payment.providerPaymentId) {
+            continue;
+          }
+
+          // 3. Exact Amount check (paise)
+          const rawAmount =
+            parsed.payload?.payment?.entity?.amount ??
+            parsed.amountPaise ??
+            parsed.amount;
+          if (rawAmount == null) continue;
+          if (BigInt(rawAmount) !== BigInt(payment.amount)) {
+            continue; // Mismatched amount rejected!
+          }
+
+          // 4. Exact Currency check
+          const eventCurrency =
+            parsed.payload?.payment?.entity?.currency ||
+            parsed.currency ||
+            "INR";
+          const paymentCurrency = payment.currency || "INR";
+          if (eventCurrency.toUpperCase() !== paymentCurrency.toUpperCase()) {
+            continue; // Mismatched currency rejected!
+          }
+
+          return true;
+        } catch {
+          continue;
+        }
       }
     } catch {
-      // If DB error, proceed to fallback check below
+      // Proceed to bank transfer check if DB lookup fails
     }
 
-    // Direct bank transfer / offline investigated payments with verified banking reference
+    // Check for Bank Transfer / Offline payments
     const isDirectBankTransfer = ["NEFT", "RTGS", "IMPS", "BANK_TRANSFER"].includes(payment.method);
-    const hasPayerProvenance = Boolean(
-      payment.payerDetails && payment.payerDetails.trim().length >= 5
-    );
-    const hasValidPaymentRef = Boolean(
-      payment.paymentReference && payment.paymentReference.trim().length >= 3
-    );
+    if (isDirectBankTransfer) {
+      // Verified receipt evidence requirement:
+      // Must have verified receipt evidence (issued receipt or verified bank statement intake),
+      // not merely a manually entered UTR string.
+      try {
+        const receipt = await client.receipt.findFirst({
+          where: { paymentId: payment.id },
+        });
+        if (receipt) return true;
+      } catch {}
 
-    return isDirectBankTransfer && hasPayerProvenance && hasValidPaymentRef;
+      try {
+        const bankEvents = await client.providerEvent.findMany({
+          where: {
+            OR: [
+              { providerEventId: payment.providerPaymentId },
+              { payloadJson: { contains: payment.providerPaymentId } },
+              { payloadJson: { contains: payment.paymentReference } },
+            ],
+          },
+        });
+        for (const be of bankEvents) {
+          if (be.signatureVerified === true) {
+            const parsed = JSON.parse(be.payloadJson);
+            if (
+              parsed.verifiedReceipt === true ||
+              be.eventType === "payment.captured" ||
+              parsed.eventType === "payment.captured"
+            ) {
+              const rawAmt = parsed.amountPaise ?? parsed.amount;
+              if (rawAmt != null && BigInt(rawAmt) === BigInt(payment.amount)) {
+                return true;
+              }
+            }
+          }
+        }
+      } catch {}
+
+      return false;
+    }
+
+    return false;
   }
 
   private verifyAuthoritativeCaptureDemo(payment: any): boolean {
@@ -2031,21 +2112,94 @@ export class PaymentService {
       payment.orderId
     );
 
-    if (providerEvents.length > 0) {
-      return providerEvents.some(
-        (e) => e.signatureVerified === true || e.providerEventId.startsWith("reconcile_")
-      );
+    for (const event of providerEvents) {
+      if (event.provider !== payment.provider) continue;
+
+      const isVerifiedWebhook = event.signatureVerified === true;
+      const isReconciled =
+        event.providerEventId === `reconcile_${payment.providerPaymentId}` ||
+        (event.providerEventId?.startsWith("reconcile_") && event.payloadJson.includes(payment.providerPaymentId));
+
+      if (!isVerifiedWebhook && !isReconciled) continue;
+
+      try {
+        const parsed = JSON.parse(event.payloadJson);
+
+        // 1. Event Type must be payment.captured
+        const eventType = event.eventType || parsed.event || parsed.eventType;
+        if (eventType !== "payment.captured") continue;
+
+        // 2. Exact Provider Payment ID check
+        const eventPaymentId =
+          parsed.payload?.payment?.entity?.id ||
+          parsed.providerPaymentId ||
+          parsed.paymentId ||
+          parsed.id;
+        if (eventPaymentId && eventPaymentId !== payment.providerPaymentId) {
+          continue;
+        }
+
+        // 3. Exact Amount check (paise)
+        const rawAmount =
+          parsed.payload?.payment?.entity?.amount ??
+          parsed.amountPaise ??
+          parsed.amount;
+        if (rawAmount == null) continue;
+        if (BigInt(rawAmount) !== BigInt(payment.amount)) {
+          continue; // Mismatched amount rejected!
+        }
+
+        // 4. Exact Currency check
+        const eventCurrency =
+          parsed.payload?.payment?.entity?.currency ||
+          parsed.currency ||
+          "INR";
+        const paymentCurrency = payment.currency || "INR";
+        if (eventCurrency.toUpperCase() !== paymentCurrency.toUpperCase()) {
+          continue; // Mismatched currency rejected!
+        }
+
+        return true;
+      } catch {
+        continue;
+      }
     }
 
+    // Bank transfer check: must represent verified receipt, not merely a manually entered UTR
     const isDirectBankTransfer = ["NEFT", "RTGS", "IMPS", "BANK_TRANSFER"].includes(payment.method);
-    const hasPayerProvenance = Boolean(
-      payment.payerDetails && payment.payerDetails.trim().length >= 5
-    );
-    const hasValidPaymentRef = Boolean(
-      payment.paymentReference && payment.paymentReference.trim().length >= 3
-    );
+    if (isDirectBankTransfer) {
+      const receipts = Array.from((demoPaymentStore as any).receipts?.values?.() || []) as any[];
+      const hasReceipt = receipts.some((r: any) => r.paymentId === payment.id);
+      if (hasReceipt) return true;
 
-    return isDirectBankTransfer && hasPayerProvenance && hasValidPaymentRef;
+      const allEvents = Array.from(demoPaymentStore.providerEvents.values());
+      for (const be of allEvents) {
+        if (
+          (be.providerEventId.includes(payment.providerPaymentId) ||
+            be.payloadJson.includes(payment.providerPaymentId) ||
+            be.payloadJson.includes(payment.paymentReference)) &&
+          be.signatureVerified === true
+        ) {
+          try {
+            const parsed = JSON.parse(be.payloadJson);
+            if (
+              parsed.verifiedReceipt === true ||
+              be.eventType === "payment.captured" ||
+              parsed.eventType === "payment.captured"
+            ) {
+              const rawAmt = parsed.amountPaise ?? parsed.amount;
+              if (rawAmt != null && BigInt(rawAmt) === BigInt(payment.amount)) {
+                return true;
+              }
+            }
+          } catch {}
+        }
+      }
+
+      return false;
+    }
+
+    return false;
   }
 
   /**
@@ -2092,6 +2246,17 @@ export class PaymentService {
     return await financialLock.acquire(lockKeys, async () => {
       try {
         return await prisma.$transaction(async (tx) => {
+          // 1. Acquire PostgreSQL row-level locks FIRST on target instalments and payment
+          try {
+            await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${params.paymentId} FOR UPDATE`;
+            for (const instId of sortedInstalmentIds) {
+              await tx.$queryRaw`SELECT id FROM "Instalment" WHERE id = ${instId} FOR UPDATE`;
+            }
+          } catch {
+            // Proceed safely if raw locking is unsupported by connection pool
+          }
+
+          // 2. Fresh read inside lock
           const payment = await tx.payment.findUnique({
             where: { id: params.paymentId },
             include: {
@@ -2110,28 +2275,20 @@ export class PaymentService {
             );
           }
 
-          // Authoritative capture verification
+          // 3. Strict Authoritative capture verification
           const isAuthoritative = await this.verifyAuthoritativeCapture(payment, tx);
           if (!isAuthoritative) {
-            throw new Error(
-              `Cannot allocate payment ${payment.id}: missing or unverified authoritative capture evidence`
-            );
+            const isDirectBankTransfer = ["NEFT", "RTGS", "IMPS", "BANK_TRANSFER"].includes(payment.method);
+            const reason = isDirectBankTransfer
+              ? "bank transfer capture lacks verified receipt evidence"
+              : "missing or unverified authoritative capture evidence";
+            throw new Error(`Cannot allocate payment ${payment.id}: ${reason}`);
           }
 
           if (payment.studentId && payment.studentId !== params.studentId) {
             throw new Error(
               `Payment is already assigned to student ${payment.studentId}, cannot allocate to ${params.studentId}`
             );
-          }
-
-          // Row-level locks in PostgreSQL on target instalments and payment
-          try {
-            for (const instId of sortedInstalmentIds) {
-              await tx.$queryRaw`SELECT id FROM "Instalment" WHERE id = ${instId} FOR UPDATE`;
-            }
-            await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${params.paymentId} FOR UPDATE`;
-          } catch {
-            // Proceed safely if raw locking is unsupported by connection pool
           }
 
           // Stale balance check and authoritative balance derivation:
@@ -2368,9 +2525,11 @@ export class PaymentService {
     // Authoritative capture verification for demo store
     const isAuthoritative = this.verifyAuthoritativeCaptureDemo(payment);
     if (!isAuthoritative) {
-      throw new Error(
-        `Cannot allocate payment ${payment.id}: missing or unverified authoritative capture evidence`
-      );
+      const isDirectBankTransfer = ["NEFT", "RTGS", "IMPS", "BANK_TRANSFER"].includes(payment.method);
+      const reason = isDirectBankTransfer
+        ? "bank transfer capture lacks verified receipt evidence"
+        : "missing or unverified authoritative capture evidence";
+      throw new Error(`Cannot allocate payment ${payment.id}: ${reason}`);
     }
 
     if (payment.studentId && payment.studentId !== params.studentId) {

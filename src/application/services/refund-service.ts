@@ -1022,21 +1022,109 @@ export class RefundService {
       }
     }
 
-    // 4. Over-refund prevention: Calculate remaining refundable amount on this payment
-    const paymentRefundItems =
-      payment.refundItems && payment.refundItems.length > 0
-        ? payment.refundItems
-        : demoPaymentStore.findRefundItemsByPaymentId(payment.id);
-    const otherItems = paymentRefundItems.filter((ri: any) => ri.id !== refundItem.id);
-    const previouslyRefundedPaise = otherItems
-      .filter((ri: any) => ri.status === "SUCCEEDED" || ri.status === "PROCESSING")
-      .reduce((acc: bigint, ri: any) => acc + BigInt(ri.amount), 0n);
+    // 4. Over-refund prevention & Database-Level Locking & Reservation (BEFORE external call)
+    try {
+      await prisma.$transaction(async (tx) => {
+        // A. Database-level row lock
+        await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${payment.id} FOR UPDATE`;
 
-    const remainingRefundablePaise = BigInt(payment.amount) - previouslyRefundedPaise;
-    if (BigInt(refundItem.amount) > remainingRefundablePaise) {
-      throw new Error(
-        `Requested refund amount (${refundItem.amount}) exceeds remaining refundable amount (${remainingRefundablePaise}) on payment ${payment.id}`
-      );
+        // B. Fresh read inside lock
+        const freshPayment = await tx.payment.findUnique({
+          where: { id: payment.id },
+          include: { allocations: true, refundItems: true },
+        });
+        if (!freshPayment) {
+          throw new Error(`Original payment record not found for refund item ${refundItemId}`);
+        }
+        if (freshPayment.status !== "CAPTURED" && freshPayment.status !== "PARTIALLY_REFUNDED") {
+          throw new Error(
+            `Original payment ${freshPayment.id} status is ${freshPayment.status}; only CAPTURED payments can be refunded`
+          );
+        }
+
+        const otherItems = freshPayment.refundItems.filter((ri) => ri.id !== refundItem.id);
+        const previouslyRefundedPaise = otherItems
+          .filter((ri) => ri.status === "SUCCEEDED" || ri.status === "PROCESSING")
+          .reduce((acc, ri) => acc + BigInt(ri.amount), 0n);
+
+        const totalAllocatedPaise = freshPayment.allocations.reduce(
+          (acc, a) => acc + BigInt(a.amount),
+          0n
+        );
+
+        const remainingRefundablePaise = BigInt(freshPayment.amount) - previouslyRefundedPaise;
+        const availablePaise = BigInt(freshPayment.amount) - totalAllocatedPaise - previouslyRefundedPaise;
+
+        if (BigInt(refundItem.amount) > remainingRefundablePaise) {
+          throw new Error(
+            `Requested refund amount (${refundItem.amount}) exceeds remaining refundable amount (${remainingRefundablePaise}) on payment ${freshPayment.id}`
+          );
+        }
+
+        if (freshPayment.allocations.length > 0 && BigInt(refundItem.amount) > availablePaise) {
+          throw new Error(
+            `Requested refund amount (${refundItem.amount}) exceeds available payment balance (${availablePaise}) on payment ${freshPayment.id}`
+          );
+        }
+
+        // C. Reserve amount on payment (PROCESSING reservation)
+        const reservedUnallocated = availablePaise > BigInt(refundItem.amount)
+          ? availablePaise - BigInt(refundItem.amount)
+          : 0n;
+
+        await tx.payment.update({
+          where: { id: freshPayment.id },
+          data: { unallocatedAmount: reservedUnallocated },
+        });
+
+        await tx.refundItem.update({
+          where: { id: refundItem.id },
+          data: { status: "PROCESSING" },
+        });
+      });
+    } catch (err: any) {
+      if (err.message?.includes("exceeds") || err.message?.includes("CAPTURED")) {
+        throw err;
+      }
+      // In-memory demo store reservation fallback
+      const pay = demoPaymentStore.payments.get(payment.id);
+      if (!pay) {
+        throw new Error(`Original payment record not found for refund item ${refundItemId}`);
+      }
+      if (pay.status !== "CAPTURED" && pay.status !== "PARTIALLY_REFUNDED") {
+        throw new Error(
+          `Original payment ${pay.id} status is ${pay.status}; only CAPTURED payments can be refunded`
+        );
+      }
+
+      const allRefunds = demoPaymentStore.getRefundItemsForPayment(pay.id);
+      const otherRefunds = allRefunds.filter((r) => r.id !== refundItem.id);
+      const priorRefunded = otherRefunds
+        .filter((r) => r.status === "SUCCEEDED" || r.status === "PROCESSING")
+        .reduce((sum, r) => sum + r.amount, 0n);
+
+      const allAllocs = demoPaymentStore.getAllocationsForPayment(pay.id);
+      const totalAllocated = allAllocs.reduce((sum, a) => sum + a.amount, 0n);
+
+      const remainingRefundable = pay.amount - priorRefunded;
+      const trueAvailable = pay.amount - totalAllocated - priorRefunded;
+
+      if (BigInt(refundItem.amount) > remainingRefundable) {
+        throw new Error(
+          `Requested refund amount (${refundItem.amount}) exceeds remaining refundable amount (${remainingRefundable}) on payment ${pay.id}`
+        );
+      }
+
+      if (allAllocs.length > 0 && BigInt(refundItem.amount) > trueAvailable) {
+        throw new Error(
+          `Requested refund amount (${refundItem.amount}) exceeds available payment balance (${trueAvailable}) on payment ${pay.id}`
+        );
+      }
+
+      pay.unallocatedAmount = trueAvailable > BigInt(refundItem.amount)
+        ? trueAvailable - BigInt(refundItem.amount)
+        : 0n;
+      demoPaymentStore.updateRefundItem(refundItem.id, { status: "PROCESSING" });
     }
 
     // 5. Gateway-side balance verification via fetchPaymentRefunds (including Razorpay Dashboard refunds)
@@ -1062,16 +1150,6 @@ export class RefundService {
           );
         }
       }
-    }
-
-    // 6. Persist execution intent (PROCESSING) BEFORE calling external gateway
-    try {
-      await prisma.refundItem.update({
-        where: { id: refundItem.id },
-        data: { status: "PROCESSING" },
-      });
-    } catch {
-      demoPaymentStore.updateRefundItem(refundItem.id, { status: "PROCESSING" });
     }
 
     // 7. Stable Idempotency Key & Receipt Reference:
@@ -1152,6 +1230,9 @@ export class RefundService {
     try {
       const result = await prisma.$transaction(
         async (tx) => {
+          // Database-level row lock on Payment row
+          await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${refundItem.paymentId} FOR UPDATE`;
+
           const updatedItem = await tx.refundItem.update({
             where: { id: refundItem.id },
             data: {
@@ -1207,6 +1288,34 @@ export class RefundService {
               data: {
                 status: isFull ? "REFUNDED" : "PARTIALLY_REFUNDED",
                 unallocatedAmount: newUnallocated,
+              },
+            });
+          } else if (providerResult.status === "FAILED" && refundItem.payment) {
+            // Release reservation on failed execution
+            const allPaymentRefunds = await tx.refundItem.findMany({
+              where: { paymentId: refundItem.paymentId },
+            });
+            const otherActiveRefunds = allPaymentRefunds
+              .filter((ri) => ri.id !== refundItem.id && (ri.status === "SUCCEEDED" || ri.status === "PROCESSING"))
+              .reduce((acc, ri) => acc + BigInt(ri.amount), 0n);
+
+            const allPaymentAllocs = await tx.paymentAllocation.findMany({
+              where: { paymentId: refundItem.paymentId },
+            });
+            const totalAllocatedOnPayment = allPaymentAllocs.reduce(
+              (acc, a) => acc + BigInt(a.amount),
+              0n
+            );
+            const paymentAmount = BigInt(refundItem.payment.amount);
+            const releasedUnallocated =
+              paymentAmount > totalAllocatedOnPayment + otherActiveRefunds
+                ? paymentAmount - totalAllocatedOnPayment - otherActiveRefunds
+                : 0n;
+
+            await tx.payment.update({
+              where: { id: refundItem.paymentId },
+              data: {
+                unallocatedAmount: releasedUnallocated,
               },
             });
           }
@@ -1266,6 +1375,21 @@ export class RefundService {
               : 0n;
           pay.unallocatedAmount = newUnallocated;
           pay.status = totalRefunded >= pay.amount ? "REFUNDED" : "PARTIALLY_REFUNDED";
+        }
+      } else if (providerResult.status === "FAILED") {
+        const pay = demoPaymentStore.payments.get(refundItem.paymentId);
+        if (pay) {
+          const allPaymentRefunds = demoPaymentStore.getRefundItemsForPayment(refundItem.paymentId);
+          const otherActiveRefunds = allPaymentRefunds
+            .filter((r) => r.id !== refundItem.id && (r.status === "SUCCEEDED" || r.status === "PROCESSING"))
+            .reduce((sum, r) => sum + r.amount, 0n);
+          const allAllocs = demoPaymentStore.getAllocationsForPayment(refundItem.paymentId);
+          const totalAllocated = allAllocs.reduce((sum, a) => sum + a.amount, 0n);
+          const releasedUnallocated =
+            pay.amount > totalAllocated + otherActiveRefunds
+              ? pay.amount - totalAllocated - otherActiveRefunds
+              : 0n;
+          pay.unallocatedAmount = releasedUnallocated;
         }
       }
 
@@ -1594,6 +1718,9 @@ export class RefundService {
     try {
       await prisma.$transaction(
         async (tx) => {
+          // Database-level row lock on Payment row
+          await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${refundItem.paymentId} FOR UPDATE`;
+
           // Update RefundItem
           await tx.refundItem.update({
             where: { id: refundItem.id },
@@ -1653,6 +1780,34 @@ export class RefundService {
               data: {
                 status: isFull ? "REFUNDED" : "PARTIALLY_REFUNDED",
                 unallocatedAmount: newUnallocated,
+              },
+            });
+          } else if (targetStatus === "FAILED" && refundItem.payment) {
+            // Release reservation on failed execution
+            const allPaymentRefunds = await tx.refundItem.findMany({
+              where: { paymentId: refundItem.paymentId },
+            });
+            const otherActiveRefunds = allPaymentRefunds
+              .filter((ri) => ri.id !== refundItem.id && (ri.status === "SUCCEEDED" || ri.status === "PROCESSING"))
+              .reduce((acc, ri) => acc + BigInt(ri.amount), 0n);
+
+            const allPaymentAllocs = await tx.paymentAllocation.findMany({
+              where: { paymentId: refundItem.paymentId },
+            });
+            const totalAllocatedOnPayment = allPaymentAllocs.reduce(
+              (acc, a) => acc + BigInt(a.amount),
+              0n
+            );
+            const paymentAmount = BigInt(refundItem.payment.amount);
+            const releasedUnallocated =
+              paymentAmount > totalAllocatedOnPayment + otherActiveRefunds
+                ? paymentAmount - totalAllocatedOnPayment - otherActiveRefunds
+                : 0n;
+
+            await tx.payment.update({
+              where: { id: refundItem.paymentId },
+              data: {
+                unallocatedAmount: releasedUnallocated,
               },
             });
           }
@@ -1725,6 +1880,21 @@ export class RefundService {
               : 0n;
           pay.unallocatedAmount = newUnallocated;
           pay.status = totalRefunded >= pay.amount ? "REFUNDED" : "PARTIALLY_REFUNDED";
+        }
+      } else if (targetStatus === "FAILED") {
+        const pay = demoPaymentStore.payments.get(refundItem.paymentId);
+        if (pay) {
+          const allPaymentRefunds = demoPaymentStore.getRefundItemsForPayment(refundItem.paymentId);
+          const otherActiveRefunds = allPaymentRefunds
+            .filter((r) => r.id !== refundItem.id && (r.status === "SUCCEEDED" || r.status === "PROCESSING"))
+            .reduce((sum, r) => sum + r.amount, 0n);
+          const allAllocs = demoPaymentStore.getAllocationsForPayment(refundItem.paymentId);
+          const totalAllocated = allAllocs.reduce((sum, a) => sum + a.amount, 0n);
+          const releasedUnallocated =
+            pay.amount > totalAllocated + otherActiveRefunds
+              ? pay.amount - totalAllocated - otherActiveRefunds
+              : 0n;
+          pay.unallocatedAmount = releasedUnallocated;
         }
       }
 
