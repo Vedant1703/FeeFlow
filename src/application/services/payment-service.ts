@@ -72,6 +72,7 @@ export interface ProcessWebhookOptions {
   provider?: "RAZORPAY" | "MOCK_GATEWAY";
   signature?: string | null;
   eventId?: string | null;
+  secret?: string | null;
 }
 
 export interface WebhookProcessingResult {
@@ -773,11 +774,13 @@ export class PaymentService {
     let providerHint: "RAZORPAY" | "MOCK_GATEWAY" | undefined;
     let signatureHeader: string | null | undefined;
     let eventIdHeader: string | null | undefined;
+    let customSecret: string | undefined;
 
     if (typeof signatureOrOptions === "object" && signatureOrOptions !== null) {
       providerHint = signatureOrOptions.provider;
       signatureHeader = signatureOrOptions.signature;
       eventIdHeader = signatureOrOptions.eventId;
+      customSecret = signatureOrOptions.secret || undefined;
     } else {
       signatureHeader = signatureOrOptions;
     }
@@ -813,7 +816,7 @@ export class PaymentService {
 
     // 1. Signature verification strictly on raw body before processing
     if (provider === "RAZORPAY") {
-      const isValid = verifyRazorpayWebhookSignature(rawBody, signatureHeader);
+      const isValid = verifyRazorpayWebhookSignature(rawBody, signatureHeader, customSecret);
       if (!isValid) {
         return {
           success: false,
@@ -822,7 +825,7 @@ export class PaymentService {
         };
       }
     } else {
-      const isValid = verifyWebhookSignature(rawBody, signatureHeader);
+      const isValid = verifyWebhookSignature(rawBody, signatureHeader, customSecret);
       if (!isValid) {
         return {
           success: false,
@@ -969,7 +972,8 @@ export class PaymentService {
 
     // Step 2: Execute authoritative settlement within ACID transaction
     try {
-      return await prisma.$transaction(async (tx) => {
+      return await prisma.$transaction(
+        async (tx) => {
         // Handle payment failure event
         if (event.eventType === "payment.failed") {
           if (event.orderId) {
@@ -1150,7 +1154,7 @@ export class PaymentService {
       }
 
       // Case 3: Matched payment -> Authoritative allocation & ledger update
-      const student = await tx.student.findUnique({
+      let student = await tx.student.findUnique({
         where: { id: intent.studentId },
         include: {
           feePlans: {
@@ -1161,6 +1165,29 @@ export class PaymentService {
         },
       });
 
+      if (!student) {
+        // Fallback: Resolve studentCode (e.g. STU-0587 or stu_ishita_0587 -> STU-0587)
+        const codeMatch = intent.studentId.match(/(\d{4})/);
+        const resolvedCode = codeMatch ? `STU-${codeMatch[1]}` : intent.studentId;
+
+        student = await tx.student.findFirst({
+          where: {
+            OR: [
+              { id: intent.studentId },
+              { studentCode: resolvedCode },
+              { studentCode: intent.studentId },
+            ],
+          },
+          include: {
+            feePlans: {
+              where: { status: "ACTIVE" },
+              include: { instalments: { orderBy: { sequence: "asc" } } },
+            },
+            ledgerEntries: true,
+          },
+        });
+      }
+
       if (!student || student.feePlans.length === 0) {
         throw new Error(`Active student or fee plan not found for intent ${intent.id}`);
       }
@@ -1170,6 +1197,13 @@ export class PaymentService {
 
       if (intent.instalmentId) {
         targetInstalment = activePlan.instalments.find((i) => i.id === intent.instalmentId);
+        if (!targetInstalment) {
+          const seqMatch = intent.instalmentId.match(/(\d+)$/);
+          if (seqMatch) {
+            const seq = parseInt(seqMatch[1], 10);
+            targetInstalment = activePlan.instalments.find((i) => i.sequence === seq);
+          }
+        }
       }
       if (!targetInstalment) {
         targetInstalment = activePlan.instalments.find(
@@ -1332,6 +1366,10 @@ export class PaymentService {
         paymentId: payment.id,
         receiptNumber: receipt.receiptNumber,
       };
+    },
+    {
+      maxWait: 10000,
+      timeout: 20000,
     });
     } catch (err: any) {
       try {
@@ -1632,7 +1670,7 @@ export class PaymentService {
         where: {
           processed: false,
           signatureVerified: true,
-          processingStatus: "PENDING",
+          processingStatus: { in: ["PENDING", "FAILED"] },
         },
         orderBy: { createdAt: "asc" },
       });
@@ -1658,7 +1696,11 @@ export class PaymentService {
       // Demo store recovery fallback
       let reprocessed = 0;
       for (const event of demoPaymentStore.providerEvents.values()) {
-        if (!event.processed && event.signatureVerified && event.processingStatus === "PENDING") {
+        if (
+          !event.processed &&
+          event.signatureVerified &&
+          (event.processingStatus === "PENDING" || event.processingStatus === "FAILED")
+        ) {
           try {
             const parsed = this.parseWebhookPayload(
               event.payloadJson,
