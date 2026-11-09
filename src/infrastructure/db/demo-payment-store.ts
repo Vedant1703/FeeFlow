@@ -77,8 +77,28 @@ export interface DemoReminder {
   instalmentId: string;
   studentId: string;
   scheduledDate: Date;
-  status: "QUEUED" | "SENT" | "SKIPPED" | "CANCELLED";
+  status: "QUEUED" | "SENT" | "SKIPPED" | "CANCELLED" | "FAILED";
   skipReason?: string;
+  ruleName?: string;
+  channel?: "WHATSAPP" | "SMS";
+  language?: "en" | "hi";
+  attemptCount?: number;
+  lastError?: string | null;
+  lastAttemptAt?: Date | null;
+  dispatchedAt?: Date | null;
+  renderedMessage?: string | null;
+}
+
+export interface DemoReminderAttempt {
+  id: string;
+  reminderId: string;
+  attemptNumber: number;
+  status: "SENT" | "FAILED" | "SKIPPED";
+  error?: string | null;
+  evaluatedAmountPaise: bigint;
+  renderedMessage?: string | null;
+  provider?: string;
+  attemptedAt: Date;
 }
 
 export interface DemoWithdrawal {
@@ -161,6 +181,8 @@ class DemoPaymentStore {
   public instalments: Map<string, DomainInstalment & { status: string; studentId: string }> = new Map();
   public receipts: Map<string, DemoReceipt> = new Map();
   public reminders: DemoReminder[] = [];
+  public reminderAttempts: DemoReminderAttempt[] = [];
+  public dispatchingReminders: Set<string> = new Set();
   public withdrawals: Map<string, DemoWithdrawal> = new Map();
   public refunds: Map<string, DemoRefund> = new Map();
   public refundItems: Map<string, DemoRefundItem> = new Map();
@@ -180,6 +202,8 @@ class DemoPaymentStore {
     this.instalments.clear();
     this.receipts.clear();
     this.reminders = [];
+    this.reminderAttempts = [];
+    this.dispatchingReminders.clear();
     this.withdrawals.clear();
     this.refunds.clear();
     this.refundItems.clear();
@@ -308,6 +332,10 @@ class DemoPaymentStore {
       studentId: ishitaId,
       scheduledDate: new Date("2026-10-15"),
       status: "QUEUED",
+      ruleName: "+21d Firm Overdue",
+      channel: "SMS",
+      language: "hi",
+      attemptCount: 0,
     });
 
     // Default seeded intent for Ishita
@@ -429,6 +457,209 @@ class DemoPaymentStore {
       provider: "MOCK_GATEWAY",
       status: "PENDING",
       createdAt: new Date(),
+    });
+
+    this.reminders.push({
+      id: "rem_mohit_inst1",
+      instalmentId: instMohit1Id,
+      studentId: mohitId,
+      scheduledDate: new Date("2026-11-02T10:00:00Z"),
+      status: "QUEUED",
+      ruleName: "T-14d Advance Courtesy",
+      channel: "WHATSAPP",
+      language: "en",
+      attemptCount: 0,
+    });
+
+    // 3. Dev Sharma (STU-0622): JEE 2027 Morning, Mansarovar
+    // Inst 1: Due 2026-11-02, amount ₹30,000, FAILED delivery (3 attempts)
+    const devId = "stu_dev_0622";
+    const instDev1Id = "inst_dev_1";
+    this.students.set(devId, {
+      id: devId,
+      studentCode: "STU-0622",
+      name: "Dev Sharma",
+      centreId: "cen_mansarovar",
+      centreName: "Mansarovar, Jaipur",
+      parentPhone: "+91 98290 77889",
+    });
+    this.instalments.set(instDev1Id, {
+      id: instDev1Id,
+      studentId: devId,
+      feePlanId: "plan_dev_jee",
+      sequence: 1,
+      dueDate: new Date("2026-11-02"),
+      amount: 3000000n,
+      status: "DUE",
+    });
+    this.ledgerEntries.push({
+      id: "led_dev_chg_1",
+      studentId: devId,
+      instalmentId: instDev1Id,
+      entryType: "CHARGE",
+      amount: 3000000n,
+      entryDate: new Date("2026-06-15"),
+    });
+    this.reminders.push({
+      id: "rem_dev_failed",
+      instalmentId: instDev1Id,
+      studentId: devId,
+      scheduledDate: new Date("2026-11-02T08:30:00Z"),
+      status: "FAILED",
+      ruleName: "Due Date Final Alert",
+      channel: "SMS",
+      language: "en",
+      attemptCount: 3,
+      lastError: "Provider delivery timeout (DLR error 30008)",
+      lastAttemptAt: new Date("2026-11-02T08:31:00Z"),
+    });
+    this.reminderAttempts.push(
+      {
+        id: "att_dev_1",
+        reminderId: "rem_dev_failed",
+        attemptNumber: 1,
+        status: "FAILED",
+        error: "Provider delivery timeout (DLR error 30008)",
+        evaluatedAmountPaise: 3000000n,
+        provider: "MOCK_SMS",
+        attemptedAt: new Date("2026-11-02T08:30:00Z"),
+      },
+      {
+        id: "att_dev_2",
+        reminderId: "rem_dev_failed",
+        attemptNumber: 2,
+        status: "FAILED",
+        error: "Provider delivery timeout (DLR error 30008)",
+        evaluatedAmountPaise: 3000000n,
+        provider: "MOCK_SMS",
+        attemptedAt: new Date("2026-11-02T08:30:30Z"),
+      },
+      {
+        id: "att_dev_3",
+        reminderId: "rem_dev_failed",
+        attemptNumber: 3,
+        status: "FAILED",
+        error: "Provider delivery timeout (DLR error 30008)",
+        evaluatedAmountPaise: 3000000n,
+        provider: "MOCK_SMS",
+        attemptedAt: new Date("2026-11-02T08:31:00Z"),
+      }
+    );
+
+    // 4. Aman Joshi (STU-0891): JEE 2027 Evening, Malviya Nagar
+    // Inst 2: Due 2026-10-25, amount ₹30,000, SENT
+    const amanId = "stu_aman_0891";
+    const instAman2Id = "inst_aman_2";
+    this.students.set(amanId, {
+      id: amanId,
+      studentCode: "STU-0891",
+      name: "Aman Joshi",
+      centreId: "cen_malviya",
+      centreName: "Malviya Nagar, Jaipur",
+      parentPhone: "+91 98290 99887",
+    });
+    this.instalments.set(instAman2Id, {
+      id: instAman2Id,
+      studentId: amanId,
+      feePlanId: "plan_aman_jee",
+      sequence: 2,
+      dueDate: new Date("2026-10-25"),
+      amount: 3000000n,
+      status: "OVERDUE",
+    });
+    this.ledgerEntries.push({
+      id: "led_aman_chg_2",
+      studentId: amanId,
+      instalmentId: instAman2Id,
+      entryType: "CHARGE",
+      amount: 3000000n,
+      entryDate: new Date("2026-06-15"),
+    });
+    this.reminders.push({
+      id: "rem_aman_sent",
+      instalmentId: instAman2Id,
+      studentId: amanId,
+      scheduledDate: new Date("2026-11-02T09:00:00Z"),
+      status: "SENT",
+      ruleName: "+7d Standard Overdue",
+      channel: "SMS",
+      language: "en",
+      dispatchedAt: new Date("2026-11-02T09:02:00Z"),
+      attemptCount: 1,
+      renderedMessage:
+        "Dear Parent, Instalment 2 for Aman Joshi at Company A, Malviya Nagar has an outstanding balance of ₹30,000, which is 8 days overdue.",
+    });
+    this.reminderAttempts.push({
+      id: "att_aman_1",
+      reminderId: "rem_aman_sent",
+      attemptNumber: 1,
+      status: "SENT",
+      evaluatedAmountPaise: 3000000n,
+      renderedMessage:
+        "Dear Parent, Instalment 2 for Aman Joshi at Company A, Malviya Nagar has an outstanding balance of ₹30,000, which is 8 days overdue.",
+      provider: "MOCK_SMS",
+      attemptedAt: new Date("2026-11-02T09:02:00Z"),
+    });
+
+    // 5. Aarav Meena (STU-0412): NEET 2027 Morning, Malviya Nagar
+    // Inst 1: Paid in full (₹30,000 charge - ₹30,000 alloc = 0), SKIPPED
+    const aaravId = "stu_aarav_0412";
+    const instAarav1Id = "inst_aarav_1";
+    this.students.set(aaravId, {
+      id: aaravId,
+      studentCode: "STU-0412",
+      name: "Aarav Meena",
+      centreId: "cen_malviya",
+      centreName: "Malviya Nagar, Jaipur",
+      parentPhone: "+91 98290 11223",
+    });
+    this.instalments.set(instAarav1Id, {
+      id: instAarav1Id,
+      studentId: aaravId,
+      feePlanId: "plan_aarav_jee",
+      sequence: 1,
+      dueDate: new Date("2026-10-30"),
+      amount: 3000000n,
+      status: "PAID",
+    });
+    this.ledgerEntries.push(
+      {
+        id: "led_aarav_chg_1",
+        studentId: aaravId,
+        instalmentId: instAarav1Id,
+        entryType: "CHARGE",
+        amount: 3000000n,
+        entryDate: new Date("2026-06-15"),
+      },
+      {
+        id: "led_aarav_alloc_1",
+        studentId: aaravId,
+        instalmentId: instAarav1Id,
+        entryType: "ALLOCATION",
+        amount: -3000000n,
+        entryDate: new Date("2026-10-28"),
+      }
+    );
+    this.reminders.push({
+      id: "rem_aarav_skipped",
+      instalmentId: instAarav1Id,
+      studentId: aaravId,
+      scheduledDate: new Date("2026-11-02T09:15:00Z"),
+      status: "SKIPPED",
+      ruleName: "+3d Gentle Reminder",
+      channel: "WHATSAPP",
+      language: "hi",
+      skipReason: "Instalment settled in full",
+      attemptCount: 1,
+    });
+    this.reminderAttempts.push({
+      id: "att_aarav_1",
+      reminderId: "rem_aarav_skipped",
+      attemptNumber: 1,
+      status: "SKIPPED",
+      error: "Instalment settled in full",
+      evaluatedAmountPaise: 0n,
+      attemptedAt: new Date("2026-11-02T09:15:00Z"),
     });
 
   }
@@ -1032,6 +1263,39 @@ class DemoPaymentStore {
     return Array.from(this.payments.values())
       .filter((p) => p.matchStatus === "UNMATCHED" || p.unallocatedAmount > 0n)
       .sort((a, b) => b.paymentDate.getTime() - a.paymentDate.getTime());
+  }
+
+  findReminderById(id: string): DemoReminder | undefined {
+    return this.reminders.find((r) => r.id === id);
+  }
+
+  updateReminder(id: string, patch: Partial<DemoReminder>): void {
+    const idx = this.reminders.findIndex((r) => r.id === id);
+    if (idx !== -1) {
+      this.reminders[idx] = { ...this.reminders[idx], ...patch };
+    }
+  }
+
+  recordReminderAttempt(
+    attempt: Omit<DemoReminderAttempt, "id" | "attemptedAt"> & { attemptedAt?: Date }
+  ): DemoReminderAttempt {
+    const rec: DemoReminderAttempt = {
+      id: `att_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      attemptedAt: attempt.attemptedAt || new Date(),
+      ...attempt,
+    };
+    this.reminderAttempts.push(rec);
+    return rec;
+  }
+
+  getAttemptsForReminder(reminderId: string): DemoReminderAttempt[] {
+    return this.reminderAttempts
+      .filter((a) => a.reminderId === reminderId)
+      .sort(
+        (a, b) =>
+          b.attemptedAt.getTime() - a.attemptedAt.getTime() ||
+          b.attemptNumber - a.attemptNumber
+      );
   }
 
   recordAuditLog(data: Omit<DemoAuditLog, "id" | "createdAt">): DemoAuditLog {
