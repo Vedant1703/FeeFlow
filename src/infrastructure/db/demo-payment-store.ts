@@ -46,7 +46,7 @@ export interface DemoPayment {
   paymentDate: Date;
   method: string;
   payerDetails: string;
-  status: "PENDING" | "CAPTURED" | "FAILED" | "REFUNDED";
+  status: "PENDING" | "CAPTURED" | "FAILED" | "REFUNDED" | "PARTIALLY_REFUNDED";
   matchStatus: "MATCHED_AUTOMATIC" | "MATCHED_MANUAL" | "UNMATCHED" | "SUSPICIOUS";
   notes?: string;
 }

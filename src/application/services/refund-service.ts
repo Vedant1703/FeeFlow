@@ -38,6 +38,7 @@ import {
 import { verifyRazorpayWebhookSignature } from "@/infrastructure/payments/payment-provider";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
 import { findDemoUserByEmail } from "@/infrastructure/db/demo-data";
+import { financialLock } from "@/application/services/payment-service";
 
 export interface WithdrawalCaseSummary {
   id: string;
@@ -978,13 +979,14 @@ export class RefundService {
       throw new Error(`Original payment record not found for refund item ${refundItemId}`);
     }
 
-    const provider = params.refundProvider || getRefundProvider(payment.provider);
+    return await financialLock.acquire([`payment_${payment.id}`], async () => {
+      const provider = params.refundProvider || getRefundProvider(payment.provider);
 
-    if (payment.status !== "CAPTURED" && payment.status !== "PARTIALLY_REFUNDED") {
-      throw new Error(
-        `Original payment ${payment.id} status is ${payment.status}; only CAPTURED payments can be refunded`
-      );
-    }
+      if (payment.status !== "CAPTURED" && payment.status !== "PARTIALLY_REFUNDED") {
+        throw new Error(
+          `Original payment ${payment.id} status is ${payment.status}; only CAPTURED payments can be refunded`
+        );
+      }
 
     // 3. Concurrency protection: If currently in-flight, reconcile with gateway before retry
     if (refundItem.status === "PROCESSING" && !forceStatus) {
@@ -1178,7 +1180,7 @@ export class RefundService {
             },
           });
 
-          // If payment was refunded, update payment status
+          // If payment was refunded, update payment status and unallocatedAmount
           if (providerResult.status === "SUCCEEDED" && refundItem.payment) {
             const allPaymentRefunds = await tx.refundItem.findMany({
               where: { paymentId: refundItem.paymentId, status: "SUCCEEDED" },
@@ -1187,11 +1189,24 @@ export class RefundService {
               (acc, ri) => acc + BigInt(ri.amount),
               0n
             );
-            const isFull = totalRefundedOnPayment >= BigInt(refundItem.payment.amount);
+            const allPaymentAllocs = await tx.paymentAllocation.findMany({
+              where: { paymentId: refundItem.paymentId },
+            });
+            const totalAllocatedOnPayment = allPaymentAllocs.reduce(
+              (acc, a) => acc + BigInt(a.amount),
+              0n
+            );
+            const paymentAmount = BigInt(refundItem.payment.amount);
+            const newUnallocated =
+              paymentAmount > totalAllocatedOnPayment + totalRefundedOnPayment
+                ? paymentAmount - totalAllocatedOnPayment - totalRefundedOnPayment
+                : 0n;
+            const isFull = totalRefundedOnPayment >= paymentAmount;
             await tx.payment.update({
               where: { id: refundItem.paymentId },
               data: {
                 status: isFull ? "REFUNDED" : "PARTIALLY_REFUNDED",
+                unallocatedAmount: newUnallocated,
               },
             });
           }
@@ -1236,8 +1251,27 @@ export class RefundService {
         completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
       });
 
+      if (providerResult.status === "SUCCEEDED") {
+        const pay = demoPaymentStore.payments.get(refundItem.paymentId);
+        if (pay) {
+          const allPaymentRefunds = demoPaymentStore.getRefundItemsForPayment(refundItem.paymentId);
+          const totalRefunded = allPaymentRefunds
+            .filter((r) => r.status === "SUCCEEDED")
+            .reduce((sum, r) => sum + r.amount, 0n);
+          const allAllocs = demoPaymentStore.getAllocationsForPayment(refundItem.paymentId);
+          const totalAllocated = allAllocs.reduce((sum, a) => sum + a.amount, 0n);
+          const newUnallocated =
+            pay.amount > totalAllocated + totalRefunded
+              ? pay.amount - totalAllocated - totalRefunded
+              : 0n;
+          pay.unallocatedAmount = newUnallocated;
+          pay.status = totalRefunded >= pay.amount ? "REFUNDED" : "PARTIALLY_REFUNDED";
+        }
+      }
+
       return { item: updatedItem, refund: updatedRefund };
     }
+    });
   }
 
   /**
@@ -1592,7 +1626,7 @@ export class RefundService {
             },
           });
 
-          // If succeeded, update payment status
+          // If succeeded, update payment status and unallocatedAmount
           if (targetStatus === "SUCCEEDED" && refundItem.payment) {
             const allPaymentRefunds = await tx.refundItem.findMany({
               where: { paymentId: refundItem.paymentId, status: "SUCCEEDED" },
@@ -1601,11 +1635,24 @@ export class RefundService {
               (acc, ri) => acc + BigInt(ri.amount),
               0n
             );
-            const isFull = totalRefundedOnPayment >= BigInt(refundItem.payment.amount);
+            const allPaymentAllocs = await tx.paymentAllocation.findMany({
+              where: { paymentId: refundItem.paymentId },
+            });
+            const totalAllocatedOnPayment = allPaymentAllocs.reduce(
+              (acc, a) => acc + BigInt(a.amount),
+              0n
+            );
+            const paymentAmount = BigInt(refundItem.payment.amount);
+            const newUnallocated =
+              paymentAmount > totalAllocatedOnPayment + totalRefundedOnPayment
+                ? paymentAmount - totalAllocatedOnPayment - totalRefundedOnPayment
+                : 0n;
+            const isFull = totalRefundedOnPayment >= paymentAmount;
             await tx.payment.update({
               where: { id: refundItem.paymentId },
               data: {
                 status: isFull ? "REFUNDED" : "PARTIALLY_REFUNDED",
+                unallocatedAmount: newUnallocated,
               },
             });
           }
@@ -1662,6 +1709,24 @@ export class RefundService {
         status: aggregate.dbStatus,
         completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
       });
+
+      if (targetStatus === "SUCCEEDED") {
+        const pay = demoPaymentStore.payments.get(refundItem.paymentId);
+        if (pay) {
+          const allPaymentRefunds = demoPaymentStore.getRefundItemsForPayment(refundItem.paymentId);
+          const totalRefunded = allPaymentRefunds
+            .filter((r) => r.status === "SUCCEEDED")
+            .reduce((sum, r) => sum + r.amount, 0n);
+          const allAllocs = demoPaymentStore.getAllocationsForPayment(refundItem.paymentId);
+          const totalAllocated = allAllocs.reduce((sum, a) => sum + a.amount, 0n);
+          const newUnallocated =
+            pay.amount > totalAllocated + totalRefunded
+              ? pay.amount - totalAllocated - totalRefunded
+              : 0n;
+          pay.unallocatedAmount = newUnallocated;
+          pay.status = totalRefunded >= pay.amount ? "REFUNDED" : "PARTIALLY_REFUNDED";
+        }
+      }
 
       demoPaymentStore.recordProviderEvent({
         provider,

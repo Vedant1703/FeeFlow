@@ -257,6 +257,55 @@ function isPrismaConnectionError(err: any): boolean {
   );
 }
 
+export function isDemoFallbackPermitted(): boolean {
+  if (process.env.NODE_ENV === "production" || process.env.APP_ENV === "production") {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * In-memory mutex for cross-payment instalment and payment concurrency protection.
+ * Complements PostgreSQL row-level locks (SELECT ... FOR UPDATE) for defense in depth.
+ */
+export class FinancialAsyncLock {
+  private lockMap = new Map<string, Promise<void>>();
+
+  async acquire<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+    const sortedKeys = [...new Set(keys)].sort();
+    let release!: () => void;
+    const currentLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    // Wait sequentially for any active lock on any of the target keys
+    for (const key of sortedKeys) {
+      const existing = this.lockMap.get(key);
+      if (existing) {
+        await existing;
+      }
+    }
+
+    // Set lock on all target keys
+    for (const key of sortedKeys) {
+      this.lockMap.set(key, currentLock);
+    }
+
+    try {
+      return await fn();
+    } finally {
+      for (const key of sortedKeys) {
+        if (this.lockMap.get(key) === currentLock) {
+          this.lockMap.delete(key);
+        }
+      }
+      release();
+    }
+  }
+}
+
+export const financialLock = new FinancialAsyncLock();
+
 let receiptCounter = 0;
 
 export function generateSequentialReceiptNumber(): string {
@@ -686,6 +735,10 @@ export class PaymentService {
       }
     } catch {}
 
+    if (!isDemoFallbackPermitted()) {
+      return null;
+    }
+
     const demo = demoPaymentStore.findPaymentIntent(orderId);
     if (demo) {
       const provider = getPaymentProvider((demo.provider || "MOCK_GATEWAY") as any);
@@ -722,6 +775,10 @@ export class PaymentService {
         };
       }
     } catch {}
+
+    if (!isDemoFallbackPermitted()) {
+      return null;
+    }
 
     for (const p of demoPaymentStore.payments.values()) {
       if (p.orderId === orderId) {
@@ -1049,6 +1106,11 @@ export class PaymentService {
       return await this.processNormalizedWithPrisma(event);
     } catch (err: any) {
       if (isPrismaConnectionError(err)) {
+        if (!isDemoFallbackPermitted()) {
+          throw new Error(
+            `Production database error: ${err.message}. In-memory demo fallback is strictly prohibited in production.`
+          );
+        }
         return this.processNormalizedWithDemoStore(event);
       }
       throw err;
@@ -1577,6 +1639,11 @@ export class PaymentService {
   private processNormalizedWithDemoStore(
     event: NormalizedWebhookEvent
   ): WebhookProcessingResult {
+    if (!isDemoFallbackPermitted()) {
+      throw new Error(
+        "In-memory demo fallback is strictly prohibited in production mode."
+      );
+    }
     // Level A Idempotency Check
     const existing = demoPaymentStore.findProviderEvent(event.provider, event.eventId);
     if (existing && existing.processed) {
@@ -1909,6 +1976,79 @@ export class PaymentService {
   }
 
   /**
+   * Helper to verify whether a payment has authoritative, verified capture evidence.
+   * Rejects unverified webhook events or phantom payment records.
+   * Preserves legitimate manually investigated bank payments with verified provenance.
+   */
+  private async verifyAuthoritativeCapture(payment: any, tx?: any): Promise<boolean> {
+    if (payment.status !== "CAPTURED") return false;
+
+    // Check provider event intake evidence
+    try {
+      const client = tx || prisma;
+      const providerEvents = await client.providerEvent.findMany({
+        where: {
+          provider: payment.provider,
+          OR: [
+            { providerEventId: payment.providerPaymentId },
+            { payloadJson: { contains: payment.providerPaymentId } },
+            ...(payment.orderId ? [{ payloadJson: { contains: payment.orderId } }] : []),
+          ],
+        },
+      });
+
+      if (providerEvents.length > 0) {
+        // Must have at least one verified event or trusted server reconciliation
+        const hasVerified = providerEvents.some(
+          (e: any) =>
+            e.signatureVerified === true ||
+            (e.providerEventId && e.providerEventId.startsWith("reconcile_"))
+        );
+        return hasVerified;
+      }
+    } catch {
+      // If DB error, proceed to fallback check below
+    }
+
+    // Direct bank transfer / offline investigated payments with verified banking reference
+    const isDirectBankTransfer = ["NEFT", "RTGS", "IMPS", "BANK_TRANSFER"].includes(payment.method);
+    const hasPayerProvenance = Boolean(
+      payment.payerDetails && payment.payerDetails.trim().length >= 5
+    );
+    const hasValidPaymentRef = Boolean(
+      payment.paymentReference && payment.paymentReference.trim().length >= 3
+    );
+
+    return isDirectBankTransfer && hasPayerProvenance && hasValidPaymentRef;
+  }
+
+  private verifyAuthoritativeCaptureDemo(payment: any): boolean {
+    if (payment.status !== "CAPTURED") return false;
+
+    const providerEvents = demoPaymentStore.getProviderEventsForPayment(
+      payment.provider,
+      payment.providerPaymentId,
+      payment.orderId
+    );
+
+    if (providerEvents.length > 0) {
+      return providerEvents.some(
+        (e) => e.signatureVerified === true || e.providerEventId.startsWith("reconcile_")
+      );
+    }
+
+    const isDirectBankTransfer = ["NEFT", "RTGS", "IMPS", "BANK_TRANSFER"].includes(payment.method);
+    const hasPayerProvenance = Boolean(
+      payment.payerDetails && payment.payerDetails.trim().length >= 5
+    );
+    const hasValidPaymentRef = Boolean(
+      payment.paymentReference && payment.paymentReference.trim().length >= 3
+    );
+
+    return isDirectBankTransfer && hasPayerProvenance && hasValidPaymentRef;
+  }
+
+  /**
    * Manual Payment Allocation (Milestone 5A).
    * Allocates an unmatched or unallocated payment to one or more instalments
    * of a student, enforcing append-only signed ledger entries, atomicity,
@@ -1929,13 +2069,13 @@ export class PaymentService {
       throw new Error("Mandatory audit reason must be at least 3 characters");
     }
 
-    const seenInstalments = new Set<string>();
+    const sortedInstalmentIds = [...new Set(params.allocations.map((a) => a.instalmentId))].sort();
+    if (sortedInstalmentIds.length !== params.allocations.length) {
+      throw new Error("Duplicate instalment allocation detected in request");
+    }
+
     let totalToAllocate = 0n;
     for (const alloc of params.allocations) {
-      if (seenInstalments.has(alloc.instalmentId)) {
-        throw new Error(`Duplicate instalment allocation for ${alloc.instalmentId}`);
-      }
-      seenInstalments.add(alloc.instalmentId);
       const amt = BigInt(alloc.amountPaise);
       if (amt <= 0n) {
         throw new Error("Allocation amount must be a positive integer");
@@ -1943,217 +2083,262 @@ export class PaymentService {
       totalToAllocate += amt;
     }
 
-    try {
-      return await prisma.$transaction(async (tx) => {
-        const payment = await tx.payment.findUnique({
-          where: { id: params.paymentId },
-          include: {
-            allocations: true,
-            refundItems: true,
-          },
-        });
+    // Mutual exclusion lock for cross-payment instalment and payment concurrency protection
+    const lockKeys = [
+      `payment_${params.paymentId}`,
+      ...sortedInstalmentIds.map((id) => `instalment_${id}`),
+    ];
 
-        if (!payment) {
-          throw new Error("Payment record not found");
-        }
-
-        if (payment.status !== "CAPTURED") {
-          throw new Error(
-            `Cannot allocate payment in status ${payment.status}: only CAPTURED payments can be allocated`
-          );
-        }
-
-        if (payment.studentId && payment.studentId !== params.studentId) {
-          throw new Error(
-            `Payment is already assigned to student ${payment.studentId}, cannot allocate to ${params.studentId}`
-          );
-        }
-
-        const totalPriorAllocated = payment.allocations.reduce((sum, a) => sum + a.amount, 0n);
-        const totalSucceededRefunded = payment.refundItems
-          .filter((r) => r.status === "SUCCEEDED")
-          .reduce((sum, r) => sum + r.amount, 0n);
-        const availableBalance = payment.amount - totalPriorAllocated - totalSucceededRefunded;
-
-        if (totalToAllocate > availableBalance) {
-          throw new Error(
-            `Allocation amount (${totalToAllocate} paise) exceeds available payment balance (${availableBalance} paise)`
-          );
-        }
-
-        if (totalToAllocate > payment.unallocatedAmount) {
-          throw new Error(
-            `Cannot allocate ${totalToAllocate} paise: only ${payment.unallocatedAmount} paise unallocated`
-          );
-        }
-
-        const student = await tx.student.findUnique({
-          where: { id: params.studentId },
-          include: {
-            centre: true,
-            ledgerEntries: true,
-          },
-        });
-
-        if (!student) {
-          throw new Error("Student not found");
-        }
-
-        if (params.actor.role === "ACCOUNTS" && !params.actor.centreIds.includes(student.centreId)) {
-          throw new Error("Access denied: student is outside your assigned centre scope");
-        }
-
-        // Atomic decrement for concurrency protection
-        const updatePaymentRes = await tx.payment.updateMany({
-          where: {
-            id: payment.id,
-            unallocatedAmount: { gte: totalToAllocate },
-          },
-          data: {
-            unallocatedAmount: { decrement: totalToAllocate },
-            studentId: student.id,
-            matchStatus: "MATCHED_MANUAL",
-          },
-        });
-
-        if (updatePaymentRes.count === 0) {
-          throw new Error("Concurrent allocation conflict: insufficient unallocated funds");
-        }
-
-        const newUnallocated = payment.unallocatedAmount - totalToAllocate;
-        const allocationResults: AllocationItemResult[] = [];
-        const currentLedgerEntries = [...student.ledgerEntries.map((e) => ({ ...e, amount: e.amount }))];
-
-        for (const alloc of params.allocations) {
-          const amountPaise = BigInt(alloc.amountPaise);
-          const instalment = await tx.instalment.findUnique({
-            where: { id: alloc.instalmentId },
-            include: { feePlan: true },
-          });
-
-          if (!instalment) {
-            throw new Error(`Target instalment ${alloc.instalmentId} not found`);
-          }
-
-          if (instalment.feePlan.studentId !== student.id) {
-            throw new Error(
-              `Instalment ${alloc.instalmentId} does not belong to student ${student.id}`
-            );
-          }
-
-          const currentBalance = deriveInstalmentBalance(
-            {
-              id: instalment.id,
-              feePlanId: instalment.feePlanId,
-              sequence: instalment.sequence,
-              dueDate: instalment.dueDate,
-              amount: instalment.amount,
-            },
-            currentLedgerEntries,
-            new Date()
-          );
-
-          if (amountPaise > currentBalance.outstandingBalance) {
-            throw new Error(
-              `Allocation of ${amountPaise} paise exceeds current outstanding of ${currentBalance.outstandingBalance} paise for instalment ${instalment.sequence}`
-            );
-          }
-
-          const allocRecord = await tx.paymentAllocation.create({
-            data: {
-              paymentId: payment.id,
-              instalmentId: instalment.id,
-              amount: amountPaise,
-              allocatedById: params.actor.userId,
-              allocationReason: trimmedReason,
+    return await financialLock.acquire(lockKeys, async () => {
+      try {
+        return await prisma.$transaction(async (tx) => {
+          const payment = await tx.payment.findUnique({
+            where: { id: params.paymentId },
+            include: {
+              allocations: true,
+              refundItems: true,
             },
           });
 
-          const ledgerEntry = await tx.ledgerEntry.create({
+          if (!payment) {
+            throw new Error("Payment record not found");
+          }
+
+          if (payment.status !== "CAPTURED") {
+            throw new Error(
+              `Cannot allocate payment in status ${payment.status}: only CAPTURED payments can be allocated`
+            );
+          }
+
+          // Authoritative capture verification
+          const isAuthoritative = await this.verifyAuthoritativeCapture(payment, tx);
+          if (!isAuthoritative) {
+            throw new Error(
+              `Cannot allocate payment ${payment.id}: missing or unverified authoritative capture evidence`
+            );
+          }
+
+          if (payment.studentId && payment.studentId !== params.studentId) {
+            throw new Error(
+              `Payment is already assigned to student ${payment.studentId}, cannot allocate to ${params.studentId}`
+            );
+          }
+
+          // Row-level locks in PostgreSQL on target instalments and payment
+          try {
+            for (const instId of sortedInstalmentIds) {
+              await tx.$queryRaw`SELECT id FROM "Instalment" WHERE id = ${instId} FOR UPDATE`;
+            }
+            await tx.$queryRaw`SELECT id FROM "Payment" WHERE id = ${params.paymentId} FOR UPDATE`;
+          } catch {
+            // Proceed safely if raw locking is unsupported by connection pool
+          }
+
+          // Stale balance check and authoritative balance derivation:
+          // Captured amount - Prior allocations - Successful/In-flight refunds
+          const totalPriorAllocated = payment.allocations.reduce((sum, a) => sum + a.amount, 0n);
+          const activeRefundItems = payment.refundItems.filter(
+            (r) => r.status === "SUCCEEDED" || r.status === "PROCESSING"
+          );
+          const totalRefunded = activeRefundItems.reduce((sum, r) => sum + r.amount, 0n);
+          const authoritativeAvailable = payment.amount - totalPriorAllocated - totalRefunded;
+
+          if (totalToAllocate > authoritativeAvailable) {
+            throw new Error(
+              `Allocation amount (${totalToAllocate} paise) exceeds available payment balance (${authoritativeAvailable} paise; authoritative calculation: prior allocations: ${totalPriorAllocated}, refunds: ${totalRefunded})`
+            );
+          }
+
+          if (totalToAllocate > payment.unallocatedAmount) {
+            throw new Error(
+              `Cannot allocate ${totalToAllocate} paise: only ${payment.unallocatedAmount} paise unallocated`
+            );
+          }
+
+          const student = await tx.student.findUnique({
+            where: { id: params.studentId },
+            include: {
+              centre: true,
+            },
+          });
+
+          if (!student) {
+            throw new Error("Student not found");
+          }
+
+          if (params.actor.role === "ACCOUNTS" && !params.actor.centreIds.includes(student.centreId)) {
+            throw new Error("Access denied: student is outside your assigned centre scope");
+          }
+
+          // Atomic decrement for concurrency protection
+          const updatePaymentRes = await tx.payment.updateMany({
+            where: {
+              id: payment.id,
+              unallocatedAmount: { gte: totalToAllocate },
+            },
             data: {
+              unallocatedAmount: { decrement: totalToAllocate },
               studentId: student.id,
-              instalmentId: instalment.id,
-              entryType: "ALLOCATION",
-              amount: -amountPaise,
-              entryDate: new Date(),
-              referenceType: "MANUAL_ALLOCATION",
-              referenceId: payment.id,
-              createdById: params.actor.userId,
-              notes: `Manual allocation by ${params.actor.name}: ${trimmedReason}`,
+              matchStatus: "MATCHED_MANUAL",
             },
           });
 
-          currentLedgerEntries.push({ ...ledgerEntry, amount: -amountPaise });
+          if (updatePaymentRes.count === 0) {
+            throw new Error("Concurrent allocation conflict: insufficient unallocated funds");
+          }
 
-          const newOutstanding = currentBalance.outstandingBalance - amountPaise;
-          await tx.instalment.update({
-            where: { id: instalment.id },
-            data: {
-              status: newOutstanding === 0n ? "PAID" : "PARTIAL",
-            },
-          });
-
-          if (newOutstanding === 0n) {
-            await tx.reminderDispatch.updateMany({
-              where: {
-                instalmentId: instalment.id,
-                status: "QUEUED",
-              },
-              data: {
-                status: "SKIPPED",
-                skipReason: "Instalment settled",
-              },
+          // Self-heal unallocatedAmount to strictly match the authoritative formula
+          const newUnallocated = authoritativeAvailable - totalToAllocate;
+          if (newUnallocated !== payment.unallocatedAmount - totalToAllocate) {
+            await tx.payment.update({
+              where: { id: payment.id },
+              data: { unallocatedAmount: newUnallocated },
             });
           }
 
-          allocationResults.push({
-            allocationId: allocRecord.id,
-            instalmentId: instalment.id,
-            allocatedPaise: amountPaise,
-            newOutstandingPaise: newOutstanding,
+          // Query fresh ledger entries after acquiring row-level locks
+          const freshLedgerEntries = await tx.ledgerEntry.findMany({
+            where: { studentId: student.id },
           });
-        }
+          const currentLedgerEntries = [...freshLedgerEntries.map((e) => ({ ...e, amount: e.amount }))];
+          const allocationResults: AllocationItemResult[] = [];
 
-        await tx.auditLog.create({
-          data: {
-            actorId: params.actor.userId,
-            actorEmail: params.actor.email || params.actor.name,
-            actorRole: params.actor.role,
-            action: "PAYMENT_ALLOCATE",
-            entityType: "Payment",
-            entityId: payment.id,
-            centreId: student.centreId,
-            reason: trimmedReason,
-            afterJson: JSON.stringify({
-              paymentId: payment.id,
-              studentId: student.id,
-              totalAllocatedPaise: totalToAllocate.toString(),
-              remainingUnallocatedPaise: newUnallocated.toString(),
-              allocations: allocationResults.map((a) => ({
-                allocationId: a.allocationId,
-                instalmentId: a.instalmentId,
-                allocatedPaise: a.allocatedPaise.toString(),
-                newOutstandingPaise: a.newOutstandingPaise.toString(),
-              })),
-            }),
-          },
+          for (const alloc of params.allocations) {
+            const amountPaise = BigInt(alloc.amountPaise);
+            const instalment = await tx.instalment.findUnique({
+              where: { id: alloc.instalmentId },
+              include: { feePlan: true },
+            });
+
+            if (!instalment) {
+              throw new Error(`Target instalment ${alloc.instalmentId} not found`);
+            }
+
+            if (instalment.feePlan.studentId !== student.id) {
+              throw new Error(
+                `Instalment ${alloc.instalmentId} does not belong to student ${student.id}`
+              );
+            }
+
+            const currentBalance = deriveInstalmentBalance(
+              {
+                id: instalment.id,
+                feePlanId: instalment.feePlanId,
+                sequence: instalment.sequence,
+                dueDate: instalment.dueDate,
+                amount: instalment.amount,
+              },
+              currentLedgerEntries,
+              new Date()
+            );
+
+            if (amountPaise > currentBalance.outstandingBalance) {
+              throw new Error(
+                `Allocation of ${amountPaise} paise exceeds current outstanding of ${currentBalance.outstandingBalance} paise for instalment ${instalment.sequence}`
+              );
+            }
+
+            const allocRecord = await tx.paymentAllocation.create({
+              data: {
+                paymentId: payment.id,
+                instalmentId: instalment.id,
+                amount: amountPaise,
+                allocatedById: params.actor.userId,
+                allocationReason: trimmedReason,
+              },
+            });
+
+            const ledgerEntry = await tx.ledgerEntry.create({
+              data: {
+                studentId: student.id,
+                instalmentId: instalment.id,
+                entryType: "ALLOCATION",
+                amount: -amountPaise,
+                entryDate: new Date(),
+                referenceType: "MANUAL_ALLOCATION",
+                referenceId: payment.id,
+                createdById: params.actor.userId,
+                notes: `Manual allocation by ${params.actor.name}: ${trimmedReason}`,
+              },
+            });
+
+            currentLedgerEntries.push({ ...ledgerEntry, amount: -amountPaise });
+
+            const newOutstanding = currentBalance.outstandingBalance - amountPaise;
+            await tx.instalment.update({
+              where: { id: instalment.id },
+              data: {
+                status: newOutstanding === 0n ? "PAID" : "PARTIAL",
+              },
+            });
+
+            if (newOutstanding === 0n) {
+              await tx.reminderDispatch.updateMany({
+                where: {
+                  instalmentId: instalment.id,
+                  status: "QUEUED",
+                },
+                data: {
+                  status: "SKIPPED",
+                  skipReason: "Instalment settled",
+                },
+              });
+            }
+
+            allocationResults.push({
+              allocationId: allocRecord.id,
+              instalmentId: instalment.id,
+              allocatedPaise: amountPaise,
+              newOutstandingPaise: newOutstanding,
+            });
+          }
+
+          await tx.auditLog.create({
+            data: {
+              actorId: params.actor.userId,
+              actorEmail: params.actor.email || params.actor.name,
+              actorRole: params.actor.role,
+              action: "PAYMENT_ALLOCATE",
+              entityType: "Payment",
+              entityId: payment.id,
+              centreId: student.centreId,
+              reason: trimmedReason,
+              afterJson: JSON.stringify({
+                paymentId: payment.id,
+                studentId: student.id,
+                totalAllocatedPaise: totalToAllocate.toString(),
+                remainingUnallocatedPaise: newUnallocated.toString(),
+                allocations: allocationResults.map((a) => ({
+                  allocationId: a.allocationId,
+                  instalmentId: a.instalmentId,
+                  allocatedPaise: a.allocatedPaise.toString(),
+                  newOutstandingPaise: a.newOutstandingPaise.toString(),
+                })),
+              }),
+            },
+          });
+
+          return {
+            success: true,
+            paymentId: payment.id,
+            studentId: student.id,
+            totalAllocatedPaise: totalToAllocate,
+            remainingUnallocatedPaise: newUnallocated,
+            allocations: allocationResults,
+          };
         });
-
-        return {
-          success: true,
-          paymentId: payment.id,
-          studentId: student.id,
-          totalAllocatedPaise: totalToAllocate,
-          remainingUnallocatedPaise: newUnallocated,
-          allocations: allocationResults,
-        };
-      });
-    } catch (err: any) {
-      if (!isPrismaConnectionError(err)) {
-        throw err;
+      } catch (err: any) {
+        if (!isPrismaConnectionError(err)) {
+          throw err;
+        }
+        if (!isDemoFallbackPermitted()) {
+          throw new Error(
+            `Production database error: ${err.message}. In-memory demo fallback is strictly prohibited in production.`
+          );
+        }
+        return this.allocatePaymentDemoFallback(params, totalToAllocate, trimmedReason);
       }
-      return this.allocatePaymentDemoFallback(params, totalToAllocate, trimmedReason);
-    }
+    });
   }
 
   private allocatePaymentDemoFallback(
@@ -2161,6 +2346,11 @@ export class PaymentService {
     totalToAllocate: bigint,
     trimmedReason: string
   ): ManualAllocationResult {
+    if (!isDemoFallbackPermitted()) {
+      throw new Error(
+        "In-memory demo fallback is strictly prohibited in production mode."
+      );
+    }
     if (params.paymentId === "pay_demo_a91c" && !demoPaymentStore.findPaymentById("pay_demo_a91c")) {
       demoPaymentStore.seedUnmatchedPayment();
     }
@@ -2175,6 +2365,14 @@ export class PaymentService {
       );
     }
 
+    // Authoritative capture verification for demo store
+    const isAuthoritative = this.verifyAuthoritativeCaptureDemo(payment);
+    if (!isAuthoritative) {
+      throw new Error(
+        `Cannot allocate payment ${payment.id}: missing or unverified authoritative capture evidence`
+      );
+    }
+
     if (payment.studentId && payment.studentId !== params.studentId) {
       throw new Error(
         `Payment is already assigned to student ${payment.studentId}, cannot allocate to ${params.studentId}`
@@ -2184,14 +2382,15 @@ export class PaymentService {
     const priorAllocs = demoPaymentStore.getAllocationsForPayment(payment.id);
     const totalPriorAllocated = priorAllocs.reduce((sum, a) => sum + a.amount, 0n);
     const refundItems = demoPaymentStore.getRefundItemsForPayment(payment.id);
-    const totalSucceededRefunded = refundItems
-      .filter((r) => r.status === "SUCCEEDED")
-      .reduce((sum, r) => sum + r.amount, 0n);
-    const availableBalance = payment.amount - totalPriorAllocated - totalSucceededRefunded;
+    const activeRefundItems = refundItems.filter(
+      (r) => r.status === "SUCCEEDED" || r.status === "PROCESSING"
+    );
+    const totalRefunded = activeRefundItems.reduce((sum, r) => sum + r.amount, 0n);
+    const authoritativeAvailable = payment.amount - totalPriorAllocated - totalRefunded;
 
-    if (totalToAllocate > availableBalance) {
+    if (totalToAllocate > authoritativeAvailable) {
       throw new Error(
-        `Allocation amount (${totalToAllocate} paise) exceeds available payment balance (${availableBalance} paise)`
+        `Allocation amount (${totalToAllocate} paise) exceeds available payment balance (${authoritativeAvailable} paise; authoritative calculation: prior allocations: ${totalPriorAllocated}, refunds: ${totalRefunded})`
       );
     }
 
@@ -2261,7 +2460,8 @@ export class PaymentService {
     }
 
     // Phase 2: Mutation (all validations have passed!)
-    payment.unallocatedAmount -= totalToAllocate;
+    const newUnallocated = authoritativeAvailable - totalToAllocate;
+    payment.unallocatedAmount = newUnallocated;
     payment.studentId = student.id;
     payment.matchStatus = "MATCHED_MANUAL";
 
@@ -2507,6 +2707,11 @@ export class PaymentService {
       if (!isPrismaConnectionError(err)) {
         throw err;
       }
+      if (!isDemoFallbackPermitted()) {
+        throw new Error(
+          `Production database error: ${err.message}. In-memory demo fallback is strictly prohibited in production.`
+        );
+      }
       return this.getUnmatchedPaymentsDemoFallback(filters, actor);
     }
   }
@@ -2515,6 +2720,9 @@ export class PaymentService {
     filters?: UnmatchedPaymentFilters,
     actor?: Actor
   ): UnmatchedPaymentItem[] {
+    if (!isDemoFallbackPermitted()) {
+      throw new Error("In-memory demo fallback is strictly prohibited in production mode.");
+    }
     let payments = demoPaymentStore.getUnmatchedPayments();
     if (payments.length === 0 && !filters?.search && !filters?.status && !filters?.centreId) {
       demoPaymentStore.seedUnmatchedPayment();
@@ -2753,6 +2961,11 @@ export class PaymentService {
       if (!isPrismaConnectionError(err)) {
         throw err;
       }
+      if (!isDemoFallbackPermitted()) {
+        throw new Error(
+          `Production database error: ${err.message}. In-memory demo fallback is strictly prohibited in production.`
+        );
+      }
       return this.getPaymentInvestigationDetailsDemoFallback(paymentId, actor);
     }
   }
@@ -2761,6 +2974,9 @@ export class PaymentService {
     paymentId: string,
     actor: Actor
   ): PaymentInvestigationDetails {
+    if (!isDemoFallbackPermitted()) {
+      throw new Error("In-memory demo fallback is strictly prohibited in production mode.");
+    }
     if (paymentId === "pay_demo_a91c" && !demoPaymentStore.findPaymentById("pay_demo_a91c")) {
       demoPaymentStore.seedUnmatchedPayment();
     }
@@ -2934,6 +3150,11 @@ export class PaymentService {
       if (!isPrismaConnectionError(err)) {
         throw err;
       }
+      if (!isDemoFallbackPermitted()) {
+        throw new Error(
+          `Production database error: ${err.message}. In-memory demo fallback is strictly prohibited in production.`
+        );
+      }
       return this.getStudentOutstandingInstalmentsDemoFallback(studentId, actor);
     }
   }
@@ -2942,6 +3163,9 @@ export class PaymentService {
     studentId: string,
     actor: Actor
   ): StudentOutstandingInstalmentsResult {
+    if (!isDemoFallbackPermitted()) {
+      throw new Error("In-memory demo fallback is strictly prohibited in production mode.");
+    }
     const student = demoPaymentStore.getStudent(studentId);
     if (!student) {
       throw new Error("Student not found");

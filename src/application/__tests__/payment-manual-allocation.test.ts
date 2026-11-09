@@ -4,7 +4,7 @@ import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
 import { Actor } from "@/application/actor";
 import { deriveInstalmentBalance } from "@/domain/ledger";
 
-describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (12 Scenarios)", () => {
+describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (16 Scenarios)", () => {
   // Actors
   const directorActor: Actor = {
     userId: "usr_director_arvind",
@@ -243,6 +243,16 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (12 
       matchStatus: "UNMATCHED",
     });
 
+    demoPaymentStore.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "prov_big_ishita",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({ paymentId: "prov_big_ishita" }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "ALLOCATED",
+    });
+
     // Trying to allocate ₹20,000 to inst_ishita_2 (which only has ₹15,000 outstanding)
     await expect(
       paymentService.allocatePayment({
@@ -385,6 +395,16 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (12 
       payerDetails: "Mohit Gurjar",
       status: "CAPTURED",
       matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_rzp_ref_deduct",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({ paymentId: "pay_rzp_ref_deduct" }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "ALLOCATED",
     });
 
     // 1. Prior allocation of ₹10,000
@@ -562,5 +582,366 @@ describe("Milestone 5A: Unmatched Payment Investigation & Manual Allocation (12 
     expect(item!.availableBalance).toBe(500000n);
     expect(item!.student).toBeDefined();
     expect(item!.student!.name).toBe("Mohit Gurjar");
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 13: Authoritative capture verification rejects phantom/unverified payments
+  // --------------------------------------------------------------------------
+  it("Scenario 13: authoritative capture verification accepts verified webhooks and bank provenance, rejecting phantom/unverified captures", async () => {
+    // 1. Phantom gateway payment without any ProviderEvent
+    const phantomPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-PHANTOM-GATEWAY",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_phantom_rzp_99",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Unknown Payer",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: phantomPay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating unverified phantom payment",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
+
+    // 2. Gateway payment with unverified ProviderEvent (signatureVerified: false)
+    const tamperedPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-TAMPERED-SIG",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_tampered_rzp_88",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Tampered Signature",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_tampered_rzp_88",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({ paymentId: "pay_tampered_rzp_88" }),
+      signatureVerified: false, // Invalid / unverified signature
+      processed: false,
+    });
+
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: tamperedPay.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+        reason: "Allocating unverified signature payment",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/missing or unverified authoritative capture evidence/i);
+
+    // 3. Gateway payment with valid verified ProviderEvent
+    const validGatewayPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-VALID-GATEWAY",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_valid_rzp_77",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "UPI",
+      payerDetails: "Verified Webhook Payer",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_valid_rzp_77",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({ paymentId: "pay_valid_rzp_77" }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "ALLOCATED",
+    });
+
+    const validResult = await paymentService.allocatePayment({
+      paymentId: validGatewayPay.id,
+      studentId: "stu_mohit_0219",
+      allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+      reason: "Verified gateway capture allocation",
+      actor: accountsActorMansarovar,
+    });
+    expect(validResult.success).toBe(true);
+    expect(validResult.totalAllocatedPaise).toBe(500000n);
+
+    // 4. Legitimate investigated bank transfer (NEFT) with UTR provenance
+    const neftBankPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-NEFT-BANK-55",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "bank_neft_ref_55",
+      amount: 1000000n,
+      unallocatedAmount: 1000000n,
+      paymentDate: new Date(),
+      method: "NEFT",
+      payerDetails: "Mohit Gurjar / PUNB0123456 / UTR-55443322",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    const bankResult = await paymentService.allocatePayment({
+      paymentId: neftBankPay.id,
+      studentId: "stu_mohit_0219",
+      allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+      reason: "Legitimate investigated NEFT payment with banking provenance",
+      actor: accountsActorMansarovar,
+    });
+    expect(bankResult.success).toBe(true);
+    expect(bankResult.totalAllocatedPaise).toBe(500000n);
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 14: Cross-payment instalment concurrency prevents over-allocation
+  // --------------------------------------------------------------------------
+  it("Scenario 14: cross-payment instalment concurrency serializes concurrent allocations and prevents negative balances", async () => {
+    // Mohit inst_mohit_1 outstanding is ₹40,000 (4000000n).
+    // Pre-allocate ₹20,000 to leave exactly ₹20,000 outstanding (2000000n).
+    const prepPay = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-PREP-20K",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "prov_prep_20k",
+      amount: 2000000n,
+      unallocatedAmount: 2000000n,
+      paymentDate: new Date(),
+      method: "NEFT",
+      payerDetails: "Mohit Gurjar / UTR-PREP-20K",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+    await paymentService.allocatePayment({
+      paymentId: prepPay.id,
+      studentId: "stu_mohit_0219",
+      allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 2000000n }],
+      reason: "Prep allocation to leave 20,000 balance",
+      actor: accountsActorMansarovar,
+    });
+
+    const instBefore = demoPaymentStore.instalments.get("inst_mohit_1")!;
+    const ledgerBefore = demoPaymentStore.getStudentLedger("stu_mohit_0219");
+    const balBefore = deriveInstalmentBalance(instBefore, ledgerBefore, new Date());
+    expect(balBefore.outstandingBalance).toBe(2000000n); // exactly ₹20,000 remaining
+
+    // Create two separate captured payments of ₹15,000 each.
+    // Individually, each payment (₹15,000) is valid against the pre-allocation balance (₹20,000).
+    // Collectively, ₹15,000 + ₹15,000 = ₹30,000 > ₹20,000.
+    const payA = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-CONC-A",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "prov_conc_a",
+      amount: 1500000n,
+      unallocatedAmount: 1500000n,
+      paymentDate: new Date(),
+      method: "NEFT",
+      payerDetails: "Mohit Gurjar / UTR-CONC-A",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    const payB = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-CONC-B",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "prov_conc_b",
+      amount: 1500000n,
+      unallocatedAmount: 1500000n,
+      paymentDate: new Date(),
+      method: "NEFT",
+      payerDetails: "Mohit Gurjar / UTR-CONC-B",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    // Fire allocations simultaneously targeting the same instalment
+    const results = await Promise.allSettled([
+      paymentService.allocatePayment({
+        paymentId: payA.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 1500000n }],
+        reason: "Concurrent allocation A",
+        actor: accountsActorMansarovar,
+      }),
+      paymentService.allocatePayment({
+        paymentId: payB.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 1500000n }],
+        reason: "Concurrent allocation B",
+        actor: accountsActorMansarovar,
+      }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+
+    // Exactly one must succeed, and one must be rejected due to insufficient remaining balance
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    const rejectionReason = (rejected[0] as PromiseRejectedResult).reason;
+    expect(rejectionReason.message).toMatch(/exceeds current outstanding/i);
+
+    // Verify resulting instalment balance: ₹20,000 - ₹15,000 = ₹5,000 (never negative!)
+    const ledgerAfter = demoPaymentStore.getStudentLedger("stu_mohit_0219");
+    const balAfter = deriveInstalmentBalance(instBefore, ledgerAfter, new Date());
+    expect(balAfter.outstandingBalance).toBe(500000n);
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 15: Refund & allocation balance consistency and stale balance self-healing
+  // --------------------------------------------------------------------------
+  it("Scenario 15: refund and allocation balance consistency enforces in-flight refund reservations and self-heals stale balances", async () => {
+    // Payment of ₹40,000 (4000000n)
+    const payment = demoPaymentStore.recordPayment({
+      paymentReference: "PAY-REFUND-CONSISTENCY",
+      provider: "RAZORPAY",
+      providerPaymentId: "pay_rzp_consistency_1",
+      amount: 4000000n,
+      unallocatedAmount: 4000000n,
+      paymentDate: new Date(),
+      method: "Netbanking",
+      payerDetails: "Mohit Gurjar",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+    });
+
+    demoPaymentStore.recordProviderEvent({
+      provider: "RAZORPAY",
+      providerEventId: "pay_rzp_consistency_1",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({ paymentId: "pay_rzp_consistency_1" }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "ALLOCATED",
+    });
+
+    // 1. Prior allocation of ₹15,000
+    demoPaymentStore.recordAllocation({
+      paymentId: payment.id,
+      instalmentId: "inst_mohit_1",
+      amount: 1500000n,
+      allocationReason: "Prior allocation",
+    });
+
+    // 2. Succeeded refund of ₹10,000
+    const refund = demoPaymentStore.createRefund({
+      withdrawalId: "wd_test_consistency",
+      studentId: "stu_mohit_0219",
+      totalApprovedAmount: 1000000n,
+      status: "COMPLETED",
+    });
+    demoPaymentStore.createRefundItem({
+      refundId: refund.id,
+      paymentId: payment.id,
+      amount: 1000000n,
+      status: "SUCCEEDED",
+      providerRefundId: "rfnd_succeeded_1",
+    });
+
+    // Authoritative available: 40,000 - 15,000 - 10,000 = 15,000.
+    // Suppose unallocatedAmount was STALE and set to 30,000 (3000000n).
+    payment.unallocatedAmount = 3000000n;
+
+    // Attempting to allocate ₹20,000 must fail against authoritative available (₹15,000)
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: payment.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 2000000n }],
+        reason: "Attempt to allocate against stale balance",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/exceeds available payment balance/i);
+
+    // 3. In-flight PROCESSING refund of ₹10,000 reserves funds
+    demoPaymentStore.createRefundItem({
+      refundId: refund.id,
+      paymentId: payment.id,
+      amount: 1000000n,
+      status: "PROCESSING",
+      providerRefundId: "rfnd_processing_2",
+    });
+
+    // Active refunds: 10,000 (SUCCEEDED) + 10,000 (PROCESSING) = 20,000.
+    // Authoritative available: 40,000 - 15,000 - 20,000 = 5,000.
+    // Attempting to allocate ₹10,000 must fail
+    await expect(
+      paymentService.allocatePayment({
+        paymentId: payment.id,
+        studentId: "stu_mohit_0219",
+        allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 1000000n }],
+        reason: "Attempt to allocate funds reserved by in-flight refund",
+        actor: accountsActorMansarovar,
+      })
+    ).rejects.toThrow(/exceeds available payment balance/i);
+
+    // Allocating the exact available balance of ₹5,000 succeeds
+    const allocResult = await paymentService.allocatePayment({
+      paymentId: payment.id,
+      studentId: "stu_mohit_0219",
+      allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 500000n }],
+      reason: "Allocate exact remaining balance",
+      actor: accountsActorMansarovar,
+    });
+
+    expect(allocResult.success).toBe(true);
+    expect(allocResult.totalAllocatedPaise).toBe(500000n);
+    expect(allocResult.remainingUnallocatedPaise).toBe(0n);
+
+    // Verify self-healing: payment.unallocatedAmount is now 0n, not stale
+    expect(payment.unallocatedAmount).toBe(0n);
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 16: Strict demo-store isolation in production mode
+  // --------------------------------------------------------------------------
+  it("Scenario 16: strict demo-store isolation rejects fallback operations when running in production mode", async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalAppEnv = process.env.APP_ENV;
+
+    try {
+      (process.env as any).NODE_ENV = "production";
+      process.env.APP_ENV = "production";
+
+      // 1. Manual allocation must fail closed without touching demo store
+      await expect(
+        paymentService.allocatePayment({
+          paymentId: "pay_demo_a91c",
+          studentId: "stu_mohit_0219",
+          allocations: [{ instalmentId: "inst_mohit_1", amountPaise: 1000000n }],
+          reason: "Production test allocation",
+          actor: accountsActorMansarovar,
+        })
+      ).rejects.toThrow(/In-memory demo fallback is strictly prohibited in production/i);
+
+      // 2. Unmatched queue query must fail closed in production
+      await expect(
+        paymentService.getUnmatchedPayments({}, accountsActorMansarovar)
+      ).rejects.toThrow(/In-memory demo fallback is strictly prohibited in production/i);
+
+      // 3. Payment investigation details query must fail closed in production
+      await expect(
+        paymentService.getPaymentInvestigationDetails("pay_demo_a91c", accountsActorMansarovar)
+      ).rejects.toThrow(/In-memory demo fallback is strictly prohibited in production/i);
+
+      // 4. Student outstanding instalments query must fail closed in production
+      await expect(
+        paymentService.getStudentOutstandingInstalments("stu_mohit_0219", accountsActorMansarovar)
+      ).rejects.toThrow(/In-memory demo fallback is strictly prohibited in production/i);
+    } finally {
+      (process.env as any).NODE_ENV = originalNodeEnv;
+      process.env.APP_ENV = originalAppEnv;
+    }
   });
 });
