@@ -66,6 +66,7 @@ export interface NormalizedWebhookEvent {
   timestamp: Date;
   rawPayload: string;
   errorDescription?: string | null;
+  signatureVerified?: boolean;
 }
 
 export interface ProcessWebhookOptions {
@@ -742,6 +743,7 @@ export class PaymentService {
         timestamp,
         rawPayload: rawBody,
         errorDescription,
+        signatureVerified: true,
       };
     }
 
@@ -760,6 +762,7 @@ export class PaymentService {
       timestamp: new Date(),
       rawPayload: rawBody,
       errorDescription: null,
+      signatureVerified: true,
     };
   }
 
@@ -941,6 +944,24 @@ export class PaymentService {
     });
 
     if (existingPayment) {
+      if (existingEvent && !existingEvent.processed) {
+        try {
+          await prisma.providerEvent.update({
+            where: {
+              provider_providerEventId: {
+                provider: event.provider,
+                providerEventId: event.eventId,
+              },
+            },
+            data: {
+              processed: true,
+              processedAt: new Date(),
+              processingStatus: existingPayment.matchStatus === "UNMATCHED" ? "UNMATCHED" : "ALLOCATED",
+              error: null,
+            },
+          });
+        } catch {}
+      }
       return {
         success: true,
         duplicate: true,
@@ -963,7 +984,7 @@ export class PaymentService {
         providerEventId: event.eventId,
         eventType: event.eventType,
         payloadJson: event.rawPayload,
-        signatureVerified: true,
+        signatureVerified: event.signatureVerified ?? (!event.eventId.startsWith("reconcile_")),
         processed: false,
         processingStatus: "PENDING",
       },
@@ -1420,6 +1441,13 @@ export class PaymentService {
       event.providerPaymentId
     );
     if (existingPayment) {
+      if (existing && !existing.processed) {
+        demoPaymentStore.updateProviderEventStatus(
+          event.provider,
+          event.eventId,
+          existingPayment.matchStatus === "UNMATCHED" ? "UNMATCHED" : "ALLOCATED"
+        );
+      }
       const receipts = Array.from((demoPaymentStore as any).receipts?.values?.() || []) as any[];
       const receipt = receipts.find((r: any) => r.paymentId === existingPayment.id);
       return {
@@ -1437,7 +1465,7 @@ export class PaymentService {
       providerEventId: event.eventId,
       eventType: event.eventType,
       payloadJson: event.rawPayload,
-      signatureVerified: true,
+      signatureVerified: event.signatureVerified ?? (!event.eventId.startsWith("reconcile_")),
       processed: true,
       processingStatus: event.eventType === "payment.failed" ? "FAILED" : "PENDING",
     });
@@ -1655,6 +1683,7 @@ export class PaymentService {
       rawPayload: JSON.stringify(params, (_, v) =>
         typeof v === "bigint" ? v.toString() : v
       ),
+      signatureVerified: false,
     };
 
     return this.processNormalizedPayment(event);
@@ -1669,8 +1698,11 @@ export class PaymentService {
       const pendingEvents = await prisma.providerEvent.findMany({
         where: {
           processed: false,
-          signatureVerified: true,
           processingStatus: { in: ["PENDING", "FAILED"] },
+          OR: [
+            { signatureVerified: true },
+            { providerEventId: { startsWith: "reconcile_" } },
+          ],
         },
         orderBy: { createdAt: "asc" },
       });
@@ -1698,7 +1730,7 @@ export class PaymentService {
       for (const event of demoPaymentStore.providerEvents.values()) {
         if (
           !event.processed &&
-          event.signatureVerified &&
+          (event.signatureVerified || event.providerEventId.startsWith("reconcile_")) &&
           (event.processingStatus === "PENDING" || event.processingStatus === "FAILED")
         ) {
           try {
