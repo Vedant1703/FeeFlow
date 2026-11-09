@@ -1,7 +1,7 @@
 /**
  * Refund and Withdrawal Service for FeeFlow.
  * Aligned with Ministry of Education (MoE) January 2024 Guidelines,
- * Rajasthan Coaching Act 2024, and Milestone 4A specifications.
+ * Rajasthan Coaching Act 2024, and Milestones 4A & 4B specifications.
  *
  * Hard Financial & Architectural Invariants:
  * 1. Inclusive calendar days: T = days(E) - days(S) + 1, c = clamp(days(W) - days(S) + 1, 0, T).
@@ -14,7 +14,8 @@
  *    via negative signed WAIVER ledger entries with referenceType: 'WITHDRAWAL_REBASE'.
  * 7. Waived instalments are marked CANCELLED, and queued reminders are marked SKIPPED.
  * 8. Multi-item refund attribution capped strictly by each captured payment's unrefunded amount.
- * 9. Milestone 4A uses MockRefundProvider for safe execution and deterministic retry testing.
+ * 9. Milestone 4B: Razorpay Normal Refund API integration with X-Refund-Idempotency,
+ *    durable ProviderEvent intake, webhook processing, server-side reconciliation, and aggregate status.
  */
 
 import { prisma } from "@/infrastructure/db/prisma";
@@ -30,8 +31,11 @@ import { Actor, canActorAccessStudent } from "@/application/actor";
 import {
   RefundProvider,
   defaultRefundProvider,
+  getRefundProvider,
   MockRefundProvider,
+  RazorpayRefundProvider,
 } from "@/infrastructure/refunds/refund-provider";
+import { verifyRazorpayWebhookSignature } from "@/infrastructure/payments/payment-provider";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
 import { findDemoUserByEmail } from "@/infrastructure/db/demo-data";
 
@@ -54,6 +58,7 @@ export interface WithdrawalCaseSummary {
   refundPaise: bigint;
   shortfallPaise: bigint;
   status: "DRAFT" | "REQUESTED" | "APPROVED" | "REJECTED" | "EXECUTED";
+  aggregateRefundStatus?: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "PARTIALLY_REFUNDED" | "FAILED";
   requesterId: string;
   makerName: string;
   makerRole: string;
@@ -70,11 +75,56 @@ export interface WithdrawalCaseSummary {
     status: "PENDING" | "PROCESSING" | "SUCCEEDED" | "FAILED";
     providerRef?: string | null;
     failureReason?: string | null;
+    createdAt?: string;
+    retryEligible?: boolean;
   }[];
 }
 
+/**
+ * Derives the aggregate parent Refund status according to Milestone 4B Section 7 rules:
+ * - All items successfully processed: COMPLETED
+ * - Some items processed and others still pending or failed: PARTIALLY_REFUNDED
+ * - No items processed and some are still processing: PROCESSING
+ * - No items processed and every item has definitively failed: FAILED
+ * - No items processed and all approved items are awaiting execution: PENDING_EXECUTION
+ */
+export function deriveRefundAggregateStatus(
+  items: { status: string }[]
+): {
+  dbStatus: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "FAILED";
+  presentationStatus: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "PARTIALLY_REFUNDED" | "FAILED";
+} {
+  if (!items || items.length === 0) {
+    return { dbStatus: "PENDING_EXECUTION", presentationStatus: "PENDING_EXECUTION" };
+  }
+
+  const allSucceeded = items.every((it) => it.status === "SUCCEEDED");
+  const anySucceeded = items.some((it) => it.status === "SUCCEEDED");
+  const allFailed = items.every((it) => it.status === "FAILED");
+  const anyProcessing = items.some((it) => it.status === "PROCESSING");
+
+  if (allSucceeded) {
+    return { dbStatus: "COMPLETED", presentationStatus: "COMPLETED" };
+  }
+
+  if (anySucceeded) {
+    // Some succeeded and others failed/pending/processing -> Partially refunded
+    return { dbStatus: "PROCESSING", presentationStatus: "PARTIALLY_REFUNDED" };
+  }
+
+  if (allFailed) {
+    return { dbStatus: "FAILED", presentationStatus: "FAILED" };
+  }
+
+  if (anyProcessing) {
+    return { dbStatus: "PROCESSING", presentationStatus: "PROCESSING" };
+  }
+
+  return { dbStatus: "PENDING_EXECUTION", presentationStatus: "PENDING_EXECUTION" };
+}
+
 export class RefundService {
-  constructor(private readonly refundProvider: RefundProvider = defaultRefundProvider) {}
+  constructor(private readonly refundProvider: RefundProvider = getRefundProvider()) {}
 
   /**
    * Retrieves active or specific refund policy with cryptographic hash and MoE 2024 terms.
@@ -424,7 +474,9 @@ export class RefundService {
   /**
    * Reviews and decides on a withdrawal request (APPROVED or REJECTED).
    * Checker: Must be DIRECTOR.
-   * HARD INVARIANT: validateMakerChecker(withdrawal.requesterId, actor.userId).
+   * HARD INVARIANTS:
+   * 1. validateMakerChecker(withdrawal.requesterId, actor.userId).
+   * 2. Section 10 Scope check: only mark Student WITHDRAWN if no other active FeePlans exist.
    */
   async reviewWithdrawal(params: {
     withdrawalId: string;
@@ -550,20 +602,30 @@ export class RefundService {
             return { withdrawal: updatedWd, status: "REJECTED" };
           }
 
-          // 2. Mark student WITHDRAWN
-          await tx.student.update({
-            where: { id: student.id },
-            data: { status: "WITHDRAWN" },
-          });
-
-          // 3. Mark active fee plan WITHDRAWN
+          // 2. Mark specific active fee plan WITHDRAWN
           if (activePlan) {
             await tx.feePlan.update({
               where: { id: activePlan.id },
               data: { status: "WITHDRAWN" },
             });
 
-            // 4. Derive instalment balances and generate WAIVER ledger entries
+            // Section 10: Preserve Student status ACTIVE if other active fee plans exist for this student
+            const remainingActivePlans = await tx.feePlan.count({
+              where: {
+                studentId: student.id,
+                id: { not: activePlan.id },
+                status: "ACTIVE",
+              },
+            });
+
+            if (remainingActivePlans === 0) {
+              await tx.student.update({
+                where: { id: student.id },
+                data: { status: "WITHDRAWN" },
+              });
+            }
+
+            // 3. Derive instalment balances and generate WAIVER ledger entries
             const instalmentsWithBalance = activePlan.instalments.map((inst: any) => {
               const bal = deriveInstalmentBalance(
                 {
@@ -627,7 +689,7 @@ export class RefundService {
             }
           }
 
-          // 5. If potential refund > 0, create Refund and plan RefundItems
+          // 4. If potential refund > 0, create Refund and plan RefundItems
           let refundRecord: any = null;
           if (withdrawal.potentialRefund > 0n) {
             refundRecord = await tx.refund.create({
@@ -666,7 +728,7 @@ export class RefundService {
             }
           }
 
-          // 6. Audit log
+          // 5. Audit log
           await tx.auditLog.create({
             data: {
               actorId: actor.userId,
@@ -776,19 +838,21 @@ export class RefundService {
   }
 
   /**
-   * Executes a single planned refund item with the mock refund provider.
-   * Updates parent Refund status atomically:
-   * If all items SUCCEEDED -> Refund becomes COMPLETED.
-   * If any item fails -> Refund marked FAILED (and is retryable).
+   * Executes a single planned refund item with Razorpay Normal Refund API or Mock provider.
+   * Hard Invariants:
+   * 1. Does not make external Razorpay call inside long-running DB transaction.
+   * 2. Concurrency protection: Locks item as PROCESSING before external call.
+   * 3. Stable X-Refund-Idempotency header reused on retry.
+   * 4. Over-refund prevention: checks remaining eligible captured balance.
+   * 5. Parent Refund aggregate status updated using Section 7 rules.
    */
   async executeRefundItem(params: {
     refundItemId: string;
     actor: Actor;
-    forceStatus?: "SUCCEEDED" | "FAILED";
+    forceStatus?: "SUCCEEDED" | "PROCESSING" | "FAILED";
     refundProvider?: RefundProvider;
   }) {
     const { refundItemId, actor, forceStatus } = params;
-    const provider = params.refundProvider || this.refundProvider;
 
     if (actor.role !== "ACCOUNTS" && actor.role !== "DIRECTOR") {
       throw new Error("Unauthorized: Only Accounts or Director can execute refund items");
@@ -799,7 +863,11 @@ export class RefundService {
       refundItem = await prisma.refundItem.findUnique({
         where: { id: refundItemId },
         include: {
-          payment: true,
+          payment: {
+            include: {
+              refundItems: true,
+            },
+          },
           refund: {
             include: {
               items: true,
@@ -817,16 +885,21 @@ export class RefundService {
       if (demoItem) {
         const demoRefund = demoPaymentStore.getRefund(demoItem.refundId);
         const demoWd = demoRefund ? demoPaymentStore.getWithdrawal(demoRefund.withdrawalId) : null;
+        const demoPayment = demoPaymentStore.payments.get(demoItem.paymentId);
+        const siblingItems = demoPaymentStore.getRefundItemsByRefundId(demoItem.refundId);
+
         refundItem = {
           ...demoItem,
-          payment: demoPaymentStore.payments.get(demoItem.paymentId) || {
+          payment: demoPayment || {
             id: demoItem.paymentId,
             providerPaymentId: `rzp_${demoItem.paymentId}`,
             amount: demoItem.amount,
+            status: "CAPTURED",
+            refundItems: siblingItems,
           },
           refund: {
             ...demoRefund,
-            items: demoPaymentStore.getRefundItemsByRefundId(demoItem.refundId),
+            items: siblingItems,
             withdrawal: demoWd
               ? {
                   ...demoWd,
@@ -842,18 +915,102 @@ export class RefundService {
       throw new Error(`Refund item ${refundItemId} not found`);
     }
 
+    // 1. Prevent duplicate execution of already succeeded refund
     if (refundItem.status === "SUCCEEDED") {
       throw new Error("Refund item has already succeeded; duplicate execution rejected");
     }
 
-    const providerResult = await provider.executeRefund({
-      refundItemId: refundItem.id,
-      paymentId: refundItem.paymentId,
-      providerPaymentId: refundItem.payment?.providerPaymentId || undefined,
-      amountPaise: BigInt(refundItem.amount),
-      forceStatus,
-    });
+    // 2. Concurrency protection: Reject if currently in-flight
+    if (refundItem.status === "PROCESSING" && !forceStatus) {
+      const timeDiff = Date.now() - new Date(refundItem.createdAt).getTime();
+      if (timeDiff < 2 * 60 * 1000) {
+        throw new Error(
+          "Refund item execution is currently in-flight; concurrent execution rejected"
+        );
+      }
+    }
 
+    // 3. Payment association and state verification
+    const payment = refundItem.payment;
+    if (!payment) {
+      throw new Error(`Original payment record not found for refund item ${refundItemId}`);
+    }
+
+    const provider = params.refundProvider || getRefundProvider(payment.provider);
+
+    if (payment.status !== "CAPTURED" && payment.status !== "PARTIALLY_REFUNDED") {
+      throw new Error(
+        `Original payment ${payment.id} status is ${payment.status}; only CAPTURED payments can be refunded`
+      );
+    }
+
+    // 4. Over-refund prevention: Calculate remaining refundable amount on this payment
+    const paymentRefundItems =
+      payment.refundItems && payment.refundItems.length > 0
+        ? payment.refundItems
+        : demoPaymentStore.findRefundItemsByPaymentId(payment.id);
+    const otherItems = paymentRefundItems.filter((ri: any) => ri.id !== refundItem.id);
+    const previouslyRefundedPaise = otherItems
+      .filter((ri: any) => ri.status === "SUCCEEDED" || ri.status === "PROCESSING")
+      .reduce((acc: bigint, ri: any) => acc + BigInt(ri.amount), 0n);
+
+    const remainingRefundablePaise = BigInt(payment.amount) - previouslyRefundedPaise;
+    if (BigInt(refundItem.amount) > remainingRefundablePaise) {
+      throw new Error(
+        `Requested refund amount (${refundItem.amount}) exceeds remaining refundable amount (${remainingRefundablePaise}) on payment ${payment.id}`
+      );
+    }
+
+    // 5. Check Razorpay gateway-side balance if provider supports fetchPaymentRefunds
+    if (provider.providerName === "RAZORPAY" && provider.fetchPaymentRefunds && payment.providerPaymentId) {
+      try {
+        const gatewayRefunds = await provider.fetchPaymentRefunds(payment.providerPaymentId);
+        const gatewayRefundedPaise = gatewayRefunds
+          .filter((gr: any) => gr.status === "processed" || gr.status === "created")
+          .reduce((sum: bigint, gr: any) => sum + BigInt(gr.amount), 0n);
+
+        const gatewayRemaining = BigInt(payment.amount) - gatewayRefundedPaise;
+        if (BigInt(refundItem.amount) > gatewayRemaining) {
+          throw new Error(
+            `Requested refund exceeds remaining refundable balance on Razorpay gateway (gateway remaining: ${gatewayRemaining} paise)`
+          );
+        }
+      } catch (gwErr: any) {
+        // If query fails, proceed cautiously unless it was a fatal balance error
+        if (gwErr.message?.includes("exceeds")) throw gwErr;
+      }
+    }
+
+    // 6. Persist execution intent (PROCESSING) BEFORE calling external gateway
+    try {
+      await prisma.refundItem.update({
+        where: { id: refundItem.id },
+        data: { status: "PROCESSING" },
+      });
+    } catch {
+      demoPaymentStore.updateRefundItem(refundItem.id, { status: "PROCESSING" });
+    }
+
+    // 7. Stable Idempotency Key: identical on retries of the same item
+    const idempotencyKey = `refitem_${refundItem.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+
+    // 8. Call external Refund Provider outside DB transaction
+    let providerResult: any;
+    try {
+      providerResult = await provider.executeRefund({
+        refundItemId: refundItem.id,
+        paymentId: refundItem.paymentId,
+        providerPaymentId: payment.providerPaymentId || undefined,
+        amountPaise: BigInt(refundItem.amount),
+        idempotencyKey,
+        forceStatus,
+      });
+    } catch (netErr: any) {
+      // On uncertain network error, preserve PROCESSING status for reconciliation
+      throw netErr;
+    }
+
+    // 9. Persist execution result and re-evaluate aggregate parent status
     try {
       const result = await prisma.$transaction(
         async (tx) => {
@@ -861,7 +1018,7 @@ export class RefundService {
             where: { id: refundItem.id },
             data: {
               status: providerResult.status,
-              providerRefundId: providerResult.providerRefundId,
+              providerRefundId: providerResult.providerRefundId || refundItem.providerRefundId,
               failureReason: providerResult.failureReason || null,
             },
           });
@@ -871,29 +1028,21 @@ export class RefundService {
             where: { refundId: refundItem.refundId },
           });
 
-          const allSucceeded = allItems.every((it) =>
-            it.id === refundItem.id ? providerResult.status === "SUCCEEDED" : it.status === "SUCCEEDED"
+          const aggregate = deriveRefundAggregateStatus(
+            allItems.map((it) =>
+              it.id === refundItem.id ? { status: providerResult.status } : { status: it.status }
+            )
           );
-          const anyFailed = allItems.some((it) =>
-            it.id === refundItem.id ? providerResult.status === "FAILED" : it.status === "FAILED"
-          );
-
-          let newRefundStatus: "COMPLETED" | "PROCESSING" | "FAILED" = "PROCESSING";
-          if (allSucceeded) {
-            newRefundStatus = "COMPLETED";
-          } else if (anyFailed) {
-            newRefundStatus = "FAILED";
-          }
 
           const updatedRefund = await tx.refund.update({
             where: { id: refundItem.refundId },
             data: {
-              status: newRefundStatus,
-              completedAt: allSucceeded ? new Date() : null,
+              status: aggregate.dbStatus,
+              completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
             },
           });
 
-          // If payment was fully refunded, update payment status
+          // If payment was refunded, update payment status
           if (providerResult.status === "SUCCEEDED" && refundItem.payment) {
             const allPaymentRefunds = await tx.refundItem.findMany({
               where: { paymentId: refundItem.paymentId, status: "SUCCEEDED" },
@@ -917,10 +1066,15 @@ export class RefundService {
               actorId: actor.userId,
               actorEmail: actor.email || actor.name,
               actorRole: actor.role,
-              action: providerResult.status === "SUCCEEDED" ? "REFUND_ITEM_EXECUTE" : "REFUND_ITEM_FAIL",
+              action:
+                providerResult.status === "SUCCEEDED"
+                  ? "REFUND_ITEM_EXECUTE"
+                  : providerResult.status === "FAILED"
+                  ? "REFUND_ITEM_FAIL"
+                  : "REFUND_ITEM_SUBMIT",
               entityType: "RefundItem",
               entityId: refundItem.id,
-              reason: providerResult.failureReason || "Mock refund provider execution",
+              reason: providerResult.failureReason || "Razorpay refund execution",
             },
           });
 
@@ -934,24 +1088,595 @@ export class RefundService {
       // In-memory fallback
       const updatedItem = demoPaymentStore.updateRefundItem(refundItem.id, {
         status: providerResult.status,
-        providerRefundId: providerResult.providerRefundId,
+        providerRefundId: providerResult.providerRefundId || refundItem.providerRefundId,
         failureReason: providerResult.failureReason || null,
       });
 
       const siblings = demoPaymentStore.getRefundItemsByRefundId(refundItem.refundId);
-      const allSucceeded = siblings.every((it) => it.status === "SUCCEEDED");
-      const anyFailed = siblings.some((it) => it.status === "FAILED");
-
-      let newStatus: "COMPLETED" | "PROCESSING" | "FAILED" = "PROCESSING";
-      if (allSucceeded) newStatus = "COMPLETED";
-      else if (anyFailed) newStatus = "FAILED";
+      const aggregate = deriveRefundAggregateStatus(siblings);
 
       const updatedRefund = demoPaymentStore.updateRefund(refundItem.refundId, {
-        status: newStatus,
-        completedAt: allSucceeded ? new Date() : null,
+        status: aggregate.dbStatus,
+        completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
       });
 
       return { item: updatedItem, refund: updatedRefund };
+    }
+  }
+
+  /**
+   * Processes Razorpay refund webhook events:
+   * - refund.created (marks item PROCESSING)
+   * - refund.processed (marks item SUCCEEDED, updates payment status, aggregates parent refund)
+   * - refund.failed (marks item FAILED, keeps retryable)
+   * - refund.speed_changed (informational)
+   */
+  async processRefundWebhook(
+    rawBody: string,
+    options: {
+      provider?: "RAZORPAY" | "MOCK_GATEWAY";
+      signature: string | null;
+      eventId?: string | null;
+      secret?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    duplicate?: boolean;
+    status: string;
+    refundItemId?: string;
+    error?: string;
+  }> {
+    const provider = options.provider || "RAZORPAY";
+
+    // 1. Signature Verification on exact raw body
+    if (provider === "RAZORPAY") {
+      const isValid = verifyRazorpayWebhookSignature(rawBody, options.signature, options.secret);
+      if (!isValid) {
+        return {
+          success: false,
+          status: "REJECTED",
+          error: "Invalid Razorpay webhook signature",
+        };
+      }
+    } else {
+      if (!options.signature || (!options.signature.startsWith("sig_") && options.signature !== "valid_sig")) {
+        return {
+          success: false,
+          status: "REJECTED",
+          error: "Invalid mock webhook signature",
+        };
+      }
+    }
+
+    // 2. Parse payload
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      return {
+        success: false,
+        status: "REJECTED",
+        error: "Malformed JSON payload in webhook body",
+      };
+    }
+
+    const eventType = parsed.event;
+    if (!eventType || !eventType.startsWith("refund.")) {
+      return {
+        success: false,
+        status: "IGNORED",
+        error: `Event ${eventType} is not a refund webhook event`,
+      };
+    }
+
+    const refundEntity = parsed.payload?.refund?.entity;
+    const paymentEntity = parsed.payload?.payment?.entity;
+
+    if (!refundEntity && eventType !== "refund.speed_changed") {
+      return {
+        success: false,
+        status: "REJECTED",
+        error: "Missing refund entity in webhook payload",
+      };
+    }
+
+    // 3. Event-level idempotency with ProviderEvent
+    const eventId =
+      options.eventId ||
+      parsed.id ||
+      (refundEntity?.id
+        ? `${parsed.account_id || "acc"}_${eventType}_${refundEntity.id}`
+        : `evt_rfnd_${Date.now()}`);
+
+    try {
+      const existing = await prisma.providerEvent.findUnique({
+        where: {
+          provider_providerEventId: {
+            provider,
+            providerEventId: eventId,
+          },
+        },
+      });
+
+      if (existing && existing.processed) {
+        return {
+          success: true,
+          duplicate: true,
+          status: existing.processingStatus || "ALREADY_PROCESSED",
+        };
+      }
+    } catch {
+      // In demo mode or if DB offline
+      const demoEvt = demoPaymentStore.findProviderEvent(provider, eventId);
+      if (demoEvt && demoEvt.processed) {
+        return {
+          success: true,
+          duplicate: true,
+          status: demoEvt.processingStatus || "ALREADY_PROCESSED",
+        };
+      }
+    }
+
+    // 4. Currency verification
+    if (refundEntity?.currency && refundEntity.currency !== "INR") {
+      return {
+        success: false,
+        status: "REJECTED",
+        error: `Unsupported currency: ${refundEntity.currency}. FeeFlow only accepts INR.`,
+      };
+    }
+
+    const providerRefundId = refundEntity?.id;
+    const providerPaymentId = refundEntity?.payment_id || paymentEntity?.id;
+    const amountPaise = refundEntity?.amount != null ? BigInt(refundEntity.amount) : 0n;
+
+    // 5. Handle refund.speed_changed as informational
+    if (eventType === "refund.speed_changed") {
+      try {
+        await prisma.providerEvent.create({
+          data: {
+            provider,
+            providerEventId: eventId,
+            eventType,
+            payloadJson: rawBody,
+            signatureVerified: true,
+            processed: true,
+            processingStatus: "SPEED_CHANGED",
+          },
+        });
+      } catch {
+        demoPaymentStore.recordProviderEvent({
+          provider,
+          providerEventId: eventId,
+          eventType,
+          payloadJson: rawBody,
+          signatureVerified: true,
+          processed: true,
+          processingStatus: "SPEED_CHANGED",
+        });
+      }
+      return {
+        success: true,
+        status: "SPEED_CHANGED",
+      };
+    }
+
+    // 6. Resolve corresponding RefundItem
+    let refundItem: any = null;
+    try {
+      // Lookup A: by providerRefundId
+      if (providerRefundId) {
+        refundItem = await prisma.refundItem.findFirst({
+          where: { providerRefundId },
+          include: { payment: true, refund: true },
+        });
+      }
+
+      // Lookup B: by notes.refundItemId
+      if (!refundItem && refundEntity?.notes?.refundItemId) {
+        refundItem = await prisma.refundItem.findUnique({
+          where: { id: refundEntity.notes.refundItemId },
+          include: { payment: true, refund: true },
+        });
+      }
+
+      // Lookup C: by payment.providerPaymentId or payment.id and amount
+      if (!refundItem && providerPaymentId) {
+        refundItem = await prisma.refundItem.findFirst({
+          where: {
+            OR: [
+              { payment: { providerPaymentId } },
+              { payment: { id: providerPaymentId } },
+            ],
+            amount: amountPaise,
+            status: { in: ["PENDING", "PROCESSING"] },
+          },
+          include: { payment: true, refund: true },
+        });
+      }
+    } catch {
+      // Demo store lookup
+      if (providerRefundId) {
+        const demoItem = demoPaymentStore.findRefundItemByProviderRefundId(providerRefundId);
+        if (demoItem) {
+          refundItem = {
+            ...demoItem,
+            payment: demoPaymentStore.payments.get(demoItem.paymentId),
+            refund: demoPaymentStore.getRefund(demoItem.refundId),
+          };
+        }
+      }
+      if (!refundItem && refundEntity?.notes?.refundItemId) {
+        const demoItem = demoPaymentStore.getRefundItem(refundEntity.notes.refundItemId);
+        if (demoItem) {
+          refundItem = {
+            ...demoItem,
+            payment: demoPaymentStore.payments.get(demoItem.paymentId),
+            refund: demoPaymentStore.getRefund(demoItem.refundId),
+          };
+        }
+      }
+      if (!refundItem && providerPaymentId) {
+        for (const it of demoPaymentStore.refundItems.values()) {
+          const pay = demoPaymentStore.payments.get(it.paymentId);
+          if (
+            (pay?.providerPaymentId === providerPaymentId ||
+              pay?.id === providerPaymentId ||
+              it.paymentId === providerPaymentId) &&
+            it.amount === amountPaise &&
+            (it.status === "PENDING" || it.status === "PROCESSING")
+          ) {
+            refundItem = {
+              ...it,
+              payment: pay,
+              refund: demoPaymentStore.getRefund(it.refundId),
+            };
+            break;
+          }
+        }
+      }
+    }
+
+    // If still unmatched, record ProviderEvent as UNMATCHED without modifying financial ledger
+    if (!refundItem) {
+      try {
+        await prisma.providerEvent.create({
+          data: {
+            provider,
+            providerEventId: eventId,
+            eventType,
+            payloadJson: rawBody,
+            signatureVerified: true,
+            processed: true,
+            processingStatus: "UNMATCHED",
+            error: `No matching RefundItem found for refund ${providerRefundId} on payment ${providerPaymentId}`,
+          },
+        });
+      } catch {
+        demoPaymentStore.recordProviderEvent({
+          provider,
+          providerEventId: eventId,
+          eventType,
+          payloadJson: rawBody,
+          signatureVerified: true,
+          processed: true,
+          processingStatus: "UNMATCHED",
+          error: "Unmatched refund item",
+        });
+      }
+
+      return {
+        success: true,
+        status: "UNMATCHED",
+      };
+    }
+
+    // HARD INVARIANT: Once a refund item is SUCCEEDED, out-of-order created or failed events cannot downgrade it
+    if (refundItem.status === "SUCCEEDED") {
+      return {
+        success: true,
+        duplicate: true,
+        status: "SUCCEEDED",
+        refundItemId: refundItem.id,
+      };
+    }
+
+    // 7. Execute State Transition
+    let targetStatus: "PROCESSING" | "SUCCEEDED" | "FAILED" = "PROCESSING";
+    if (eventType === "refund.processed") {
+      targetStatus = "SUCCEEDED";
+    } else if (eventType === "refund.failed") {
+      targetStatus = "FAILED";
+    } else if (eventType === "refund.created") {
+      targetStatus = "PROCESSING";
+    }
+
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          // Update RefundItem
+          await tx.refundItem.update({
+            where: { id: refundItem.id },
+            data: {
+              status: targetStatus,
+              providerRefundId: providerRefundId || refundItem.providerRefundId,
+              failureReason:
+                targetStatus === "FAILED"
+                  ? refundEntity?.error_description || "Gateway reported refund failure"
+                  : null,
+            },
+          });
+
+          // Fetch sibling items to re-evaluate parent Refund aggregate status
+          const allItems = await tx.refundItem.findMany({
+            where: { refundId: refundItem.refundId },
+          });
+
+          const aggregate = deriveRefundAggregateStatus(
+            allItems.map((it) =>
+              it.id === refundItem.id ? { status: targetStatus } : { status: it.status }
+            )
+          );
+
+          await tx.refund.update({
+            where: { id: refundItem.refundId },
+            data: {
+              status: aggregate.dbStatus,
+              completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
+            },
+          });
+
+          // If succeeded, update payment status
+          if (targetStatus === "SUCCEEDED" && refundItem.payment) {
+            const allPaymentRefunds = await tx.refundItem.findMany({
+              where: { paymentId: refundItem.paymentId, status: "SUCCEEDED" },
+            });
+            const totalRefundedOnPayment = allPaymentRefunds.reduce(
+              (acc, ri) => acc + BigInt(ri.amount),
+              0n
+            );
+            const isFull = totalRefundedOnPayment >= BigInt(refundItem.payment.amount);
+            await tx.payment.update({
+              where: { id: refundItem.paymentId },
+              data: {
+                status: isFull ? "REFUNDED" : "PARTIALLY_REFUNDED",
+              },
+            });
+          }
+
+          // Persist ProviderEvent
+          await tx.providerEvent.create({
+            data: {
+              provider,
+              providerEventId: eventId,
+              eventType,
+              payloadJson: rawBody,
+              signatureVerified: true,
+              processed: true,
+              processingStatus: targetStatus,
+            },
+          });
+
+          // Audit log
+          await tx.auditLog.create({
+            data: {
+              actorId: "system_webhook",
+              actorEmail: "webhook@razorpay.com",
+              actorRole: "DIRECTOR",
+              action: `REFUND_WEBHOOK_${targetStatus}`,
+              entityType: "RefundItem",
+              entityId: refundItem.id,
+              reason: `Razorpay webhook event: ${eventType}`,
+            },
+          });
+        },
+        { maxWait: 10000, timeout: 20000 }
+      );
+
+      return {
+        success: true,
+        status: targetStatus,
+        refundItemId: refundItem.id,
+      };
+    } catch {
+      // In-memory demo fallback
+      demoPaymentStore.updateRefundItem(refundItem.id, {
+        status: targetStatus,
+        providerRefundId: providerRefundId || refundItem.providerRefundId,
+        failureReason:
+          targetStatus === "FAILED"
+            ? refundEntity?.error_description || "Gateway reported refund failure"
+            : null,
+      });
+
+      const siblings = demoPaymentStore.getRefundItemsByRefundId(refundItem.refundId);
+      const aggregate = deriveRefundAggregateStatus(siblings);
+
+      demoPaymentStore.updateRefund(refundItem.refundId, {
+        status: aggregate.dbStatus,
+        completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
+      });
+
+      demoPaymentStore.recordProviderEvent({
+        provider,
+        providerEventId: eventId,
+        eventType,
+        payloadJson: rawBody,
+        signatureVerified: true,
+        processed: true,
+        processingStatus: targetStatus,
+      });
+
+      return {
+        success: true,
+        status: targetStatus,
+        refundItemId: refundItem.id,
+      };
+    }
+  }
+
+  /**
+   * Reconciles a refund item by polling Razorpay's GET /v1/refunds/{id} or payment refunds API.
+   * Uses identical idempotent transition logic as webhook processing.
+   */
+  async reconcileRefundItem(params: {
+    refundItemId: string;
+    actor: Actor;
+    refundProvider?: RefundProvider;
+  }): Promise<{
+    item: any;
+    refund: any;
+    reconciled: boolean;
+    providerStatus?: string;
+  }> {
+    const { refundItemId, actor } = params;
+
+    if (actor.role !== "ACCOUNTS" && actor.role !== "DIRECTOR") {
+      throw new Error("Unauthorized: Only Accounts or Director can reconcile refunds");
+    }
+
+    let refundItem: any = null;
+    try {
+      refundItem = await prisma.refundItem.findUnique({
+        where: { id: refundItemId },
+        include: { payment: true, refund: true },
+      });
+    } catch {
+      // Offline fallback
+    }
+
+    if (!refundItem) {
+      const demoItem = demoPaymentStore.getRefundItem(refundItemId);
+      if (demoItem) {
+        refundItem = {
+          ...demoItem,
+          payment: demoPaymentStore.payments.get(demoItem.paymentId),
+          refund: demoPaymentStore.getRefund(demoItem.refundId),
+        };
+      }
+    }
+
+    if (!refundItem) {
+      throw new Error(`Refund item ${refundItemId} not found`);
+    }
+
+    const provider = params.refundProvider || getRefundProvider(refundItem.payment?.provider);
+
+    // If already succeeded, reconciliation is a no-op
+    if (refundItem.status === "SUCCEEDED") {
+      return {
+        item: refundItem,
+        refund: refundItem.refund,
+        reconciled: true,
+        providerStatus: "processed",
+      };
+    }
+
+    let gatewayRefund: any = null;
+
+    // Method A: Fetch by known providerRefundId
+    if (refundItem.providerRefundId && provider.fetchRefund) {
+      try {
+        gatewayRefund = await provider.fetchRefund(refundItem.providerRefundId);
+      } catch {
+        // Continue to fallback
+      }
+    }
+
+    // Method B: Search across payment's refunds
+    if (!gatewayRefund && provider.fetchPaymentRefunds && refundItem.payment?.providerPaymentId) {
+      try {
+        const paymentRefunds = await provider.fetchPaymentRefunds(
+          refundItem.payment.providerPaymentId
+        );
+        gatewayRefund = paymentRefunds.find(
+          (gr: any) =>
+            gr.id === refundItem.providerRefundId ||
+            gr.notes?.refundItemId === refundItemId ||
+            BigInt(gr.amount) === BigInt(refundItem.amount)
+        );
+      } catch {
+        // Fallback
+      }
+    }
+
+    if (!gatewayRefund) {
+      return {
+        item: refundItem,
+        refund: refundItem.refund,
+        reconciled: false,
+      };
+    }
+
+    // Map status from fetched gateway refund
+    const targetStatus =
+      gatewayRefund.status === "processed"
+        ? "SUCCEEDED"
+        : gatewayRefund.status === "failed"
+        ? "FAILED"
+        : "PROCESSING";
+
+    try {
+      const result = await prisma.$transaction(
+        async (tx) => {
+          const updatedItem = await tx.refundItem.update({
+            where: { id: refundItem.id },
+            data: {
+              status: targetStatus,
+              providerRefundId: gatewayRefund.id,
+              failureReason: gatewayRefund.error_description || null,
+            },
+          });
+
+          const allItems = await tx.refundItem.findMany({
+            where: { refundId: refundItem.refundId },
+          });
+
+          const aggregate = deriveRefundAggregateStatus(
+            allItems.map((it) =>
+              it.id === refundItem.id ? { status: targetStatus } : { status: it.status }
+            )
+          );
+
+          const updatedRefund = await tx.refund.update({
+            where: { id: refundItem.refundId },
+            data: {
+              status: aggregate.dbStatus,
+              completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
+            },
+          });
+
+          return { item: updatedItem, refund: updatedRefund };
+        },
+        { maxWait: 10000, timeout: 20000 }
+      );
+
+      return {
+        ...result,
+        reconciled: true,
+        providerStatus: gatewayRefund.status,
+      };
+    } catch {
+      const updatedItem = demoPaymentStore.updateRefundItem(refundItem.id, {
+        status: targetStatus,
+        providerRefundId: gatewayRefund.id,
+        failureReason: gatewayRefund.error_description || null,
+      });
+
+      const siblings = demoPaymentStore.getRefundItemsByRefundId(refundItem.refundId);
+      const aggregate = deriveRefundAggregateStatus(siblings);
+
+      const updatedRefund = demoPaymentStore.updateRefund(refundItem.refundId, {
+        status: aggregate.dbStatus,
+        completedAt: aggregate.dbStatus === "COMPLETED" ? new Date() : null,
+      });
+
+      return {
+        item: updatedItem,
+        refund: updatedRefund,
+        reconciled: true,
+        providerStatus: gatewayRefund.status,
+      };
     }
   }
 
@@ -1017,6 +1742,11 @@ export class RefundService {
           const reqUser = userMap.get(r.requesterId);
           const appUser = r.approverId ? userMap.get(r.approverId) : null;
           const refund = r.refunds?.[0];
+          const items = refund?.items || [];
+
+          const aggregate = deriveRefundAggregateStatus(
+            items.map((it: any) => ({ status: it.status }))
+          );
 
           return {
             id: r.id,
@@ -1037,6 +1767,7 @@ export class RefundService {
             refundPaise: BigInt(r.potentialRefund),
             shortfallPaise: BigInt(r.indicativeShortfall),
             status: r.status as any,
+            aggregateRefundStatus: aggregate.presentationStatus,
             requesterId: r.requesterId,
             makerName: reqUser?.name || "Accounts Executive",
             makerRole: reqUser?.role || "Accounts",
@@ -1044,7 +1775,7 @@ export class RefundService {
             checkerName: appUser?.name || null,
             checkerRole: appUser?.role || null,
             approvalNotes: r.approvalNotes,
-            items: refund?.items?.map((it) => ({
+            items: items.map((it: any) => ({
               id: it.id,
               paymentId: it.paymentId,
               paymentRef: it.payment?.paymentReference || it.paymentId,
@@ -1053,6 +1784,8 @@ export class RefundService {
               status: it.status as any,
               providerRef: it.providerRefundId,
               failureReason: it.failureReason,
+              createdAt: it.createdAt ? it.createdAt.toISOString() : undefined,
+              retryEligible: it.status === "FAILED" || it.status === "PENDING",
             })),
           };
         });
@@ -1070,6 +1803,7 @@ export class RefundService {
         const isIshita = r.studentId === "stu_ishita_0587";
         const refund = demoPaymentStore.getRefundByWithdrawalId(r.id);
         const refundItems = refund ? demoPaymentStore.getRefundItemsByRefundId(refund.id) : [];
+        const aggregate = deriveRefundAggregateStatus(refundItems);
 
         return {
           id: r.id,
@@ -1090,6 +1824,7 @@ export class RefundService {
           refundPaise: r.potentialRefund,
           shortfallPaise: r.indicativeShortfall,
           status: r.status as any,
+          aggregateRefundStatus: aggregate.presentationStatus,
           requesterId: r.requesterId,
           makerName: "Neha Verma",
           makerRole: "Accounts",
@@ -1108,6 +1843,8 @@ export class RefundService {
               status: it.status as any,
               providerRef: it.providerRefundId,
               failureReason: it.failureReason,
+              createdAt: it.createdAt ? it.createdAt.toISOString() : undefined,
+              retryEligible: it.status === "FAILED" || it.status === "PENDING",
             };
           }),
         };

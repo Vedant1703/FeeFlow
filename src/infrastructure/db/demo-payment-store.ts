@@ -812,6 +812,19 @@ class DemoPaymentStore {
     return this.refundItems.get(id) || null;
   }
 
+  findRefundItemByProviderRefundId(providerRefundId: string): DemoRefundItem | null {
+    for (const item of this.refundItems.values()) {
+      if (item.providerRefundId === providerRefundId) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  findRefundItemsByPaymentId(paymentId: string): DemoRefundItem[] {
+    return Array.from(this.refundItems.values()).filter((it) => it.paymentId === paymentId);
+  }
+
   getRefundItemsByRefundId(refundId: string): DemoRefundItem[] {
     return Array.from(this.refundItems.values()).filter((it) => it.refundId === refundId);
   }

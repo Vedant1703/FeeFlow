@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { paymentService } from "@/application/services/payment-service";
+import { refundService } from "@/application/services/refund-service";
 
 export async function POST(req: Request) {
   try {
@@ -30,6 +31,37 @@ export async function POST(req: Request) {
     const isRazorpay = Boolean(razorpaySig);
     const signature = razorpaySig || (isMockAllowed ? mockSig : null);
     const provider = isRazorpay ? "RAZORPAY" : "MOCK_GATEWAY";
+
+    // Inspect event payload to route refund vs payment events
+    let eventName = "";
+    try {
+      const parsed = JSON.parse(rawBody);
+      eventName = parsed?.event || "";
+    } catch {
+      // Non-JSON payloads will be rejected cleanly by the service
+    }
+
+    if (eventName.startsWith("refund.")) {
+      const refundResult = await refundService.processRefundWebhook(rawBody, {
+        provider,
+        signature,
+        eventId: razorpayEventId,
+      });
+
+      if (!refundResult.success) {
+        return NextResponse.json(
+          { error: refundResult.error || "Refund webhook verification failed" },
+          { status: 400 }
+        );
+      }
+
+      return NextResponse.json({
+        received: true,
+        duplicate: !!refundResult.duplicate,
+        status: refundResult.status,
+        refundItemId: refundResult.refundItemId,
+      });
+    }
 
     const result = await paymentService.processWebhook(rawBody, {
       provider,

@@ -44,6 +44,7 @@ interface WithdrawalCase {
   refundPaise: bigint;
   shortfallPaise: bigint;
   status: "DRAFT" | "REQUESTED" | "APPROVED" | "REJECTED" | "EXECUTED" | "SUBMITTED" | "COMPLETED";
+  aggregateRefundStatus?: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "PARTIALLY_REFUNDED" | "FAILED";
   requesterId?: string;
   makerName: string;
   makerRole: string;
@@ -82,6 +83,7 @@ const INITIAL_FALLBACK_CASES: WithdrawalCase[] = [
     refundPaise: 6372414n,
     shortfallPaise: 0n,
     status: "APPROVED",
+    aggregateRefundStatus: "PARTIALLY_REFUNDED",
     requesterId: "usr_accounts_neha",
     makerName: "Neha Verma",
     makerRole: "Accounts",
@@ -343,6 +345,26 @@ export default function WithdrawalsPage() {
         };
       });
       showToast("Refund item retried with gateway.", "ok");
+    }
+  };
+
+  // Reconcile refund item directly with Razorpay gateway
+  const handleReconcileItem = async (itemId: string) => {
+    try {
+      const res = await fetch("/api/withdrawals/reconcile-item", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refundItemId: itemId }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || "Reconciled with Razorpay gateway.", "ok");
+        await fetchCases();
+      } else {
+        showToast(data.error || "Reconciliation failed", "err");
+      }
+    } catch {
+      showToast("Network error during reconciliation", "err");
     }
   };
 
@@ -643,9 +665,26 @@ export default function WithdrawalsPage() {
               {selectedCase.items && selectedCase.items.length > 0 && (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-ink">
-                      Refund Dispatch Items ({selectedCase.items.length})
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-ink">
+                        Refund Dispatch Items ({selectedCase.items.length})
+                      </span>
+                      {selectedCase.aggregateRefundStatus && (
+                        <StatusChip
+                          tone={
+                            selectedCase.aggregateRefundStatus === "COMPLETED"
+                              ? "ok"
+                              : selectedCase.aggregateRefundStatus === "PARTIALLY_REFUNDED" ||
+                                selectedCase.aggregateRefundStatus === "PROCESSING"
+                              ? "info"
+                              : selectedCase.aggregateRefundStatus === "FAILED"
+                              ? "bad"
+                              : "warn"
+                          }
+                          text={selectedCase.aggregateRefundStatus.replace(/_/g, " ")}
+                        />
+                      )}
+                    </div>
                     <span className="text-[11px] text-ink-3">
                       Capped at each original payment source
                     </span>
@@ -663,21 +702,23 @@ export default function WithdrawalsPage() {
                             <div className="text-[11px] text-ink-3">
                               {it.method} · Ref: {it.providerRef || "Pending Gateway Execution"}
                               {it.failureReason && (
-                                <span className="text-bad ml-2">({it.failureReason})</span>
+                                <span className="text-bad ml-2 font-medium">({it.failureReason})</span>
                               )}
                             </div>
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-3">
-                          <span className="font-mono font-bold text-ink">{formatINR(it.amountPaise)}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-ink mr-1">{formatINR(it.amountPaise)}</span>
                           <StatusChip
                             tone={
                               it.status === "SUCCEEDED" || it.status === "COMPLETED"
                                 ? "ok"
                                 : it.status === "PROCESSING"
                                 ? "info"
-                                : "bad"
+                                : it.status === "FAILED"
+                                ? "bad"
+                                : "warn"
                             }
                             text={it.status}
                           />
@@ -685,13 +726,30 @@ export default function WithdrawalsPage() {
                             <button
                               onClick={() => handleRetryItem(it.id)}
                               className="px-2 py-1 bg-bad/10 hover:bg-bad/20 text-bad rounded text-xs font-semibold flex items-center gap-1 transition-colors"
+                              title="Retry execution with gateway"
                             >
                               <RotateCw className="w-3 h-3" /> Retry Item
+                            </button>
+                          )}
+                          {(it.status === "PROCESSING" || it.status === "FAILED") && (
+                            <button
+                              onClick={() => handleReconcileItem(it.id)}
+                              className="px-2 py-1 bg-teal-t hover:bg-teal-t/80 text-teal rounded text-xs font-semibold flex items-center gap-1 transition-colors"
+                              title="Reconcile latest status from Razorpay"
+                            >
+                              <RotateCw className="w-3 h-3" /> Reconcile
                             </button>
                           )}
                         </div>
                       </div>
                     ))}
+                  </div>
+
+                  <div className="p-2.5 bg-paper rounded-lg border border-line text-[11px] text-ink-3 flex items-center gap-2">
+                    <Info className="w-3.5 h-3.5 text-teal shrink-0" />
+                    <span>
+                      Normal refunds return to the parent&apos;s original payment method via standard banking rails (typically 5–7 business days).
+                    </span>
                   </div>
 
                   {selectedCase.items.some((it) => it.status !== "SUCCEEDED" && it.status !== "COMPLETED") && (
