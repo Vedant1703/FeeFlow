@@ -123,6 +123,9 @@ export interface DemoRefundItem {
   failureReason?: string | null;
   providerRefundId?: string | null;
   createdAt: Date;
+  attemptCount?: number;
+  lastAttemptKey?: string;
+  lastReceipt?: string;
 }
 
 class DemoPaymentStore {
@@ -840,6 +843,31 @@ class DemoPaymentStore {
     };
     this.refundItems.set(id, updated);
     return updated;
+  }
+
+  getRefundItemAttempt(id: string): { attemptCount: number; key: string; receipt: string } {
+    const existing = this.refundItems.get(id);
+    const count = existing?.attemptCount || 1;
+    const cleanId = id.replace(/[^a-zA-Z0-9_-]/g, "");
+    return {
+      attemptCount: count,
+      key: count > 1 ? `refitem_${cleanId}_att${count}` : `refitem_${cleanId}`,
+      receipt: count > 1 ? `rfnd_${cleanId.slice(-8)}_a${count}`.slice(0, 40) : `rfnd_${cleanId.slice(-8)}`.slice(0, 40),
+    };
+  }
+
+  incrementRefundItemAttempt(id: string): { attemptCount: number; key: string; receipt: string } {
+    const existing = this.refundItems.get(id);
+    const newCount = (existing?.attemptCount || 1) + 1;
+    const cleanId = id.replace(/[^a-zA-Z0-9_-]/g, "");
+    const key = `refitem_${cleanId}_att${newCount}`;
+    const receipt = `rfnd_${cleanId.slice(-8)}_a${newCount}`.slice(0, 40);
+    if (existing) {
+      existing.attemptCount = newCount;
+      existing.lastAttemptKey = key;
+      existing.lastReceipt = receipt;
+    }
+    return { attemptCount: newCount, key, receipt };
   }
 }
 

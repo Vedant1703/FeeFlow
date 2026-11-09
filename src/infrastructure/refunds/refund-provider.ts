@@ -117,6 +117,16 @@ export class MockRefundProvider implements RefundProvider {
       (r) => r.payment_id === providerPaymentId
     );
   }
+
+  addExternalRefund(refundObj: {
+    id: string;
+    payment_id: string;
+    amount: number;
+    status: string;
+    notes?: any;
+  }) {
+    this.inMemoryRefunds.set(refundObj.id, refundObj);
+  }
 }
 
 /**

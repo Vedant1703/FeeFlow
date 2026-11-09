@@ -838,6 +838,38 @@ export class RefundService {
   }
 
   /**
+   * Asserts that a provider refund ID is unique and not already linked to another RefundItem.
+   */
+  async assertUniqueProviderRefundId(
+    providerRefundId: string | null | undefined,
+    currentItemId: string
+  ) {
+    if (!providerRefundId) return;
+
+    try {
+      const existing = await prisma.refundItem.findFirst({
+        where: {
+          providerRefundId,
+          id: { not: currentItemId },
+        },
+      });
+      if (existing) {
+        throw new Error(
+          `CRITICAL INVARIANT VIOLATION: Provider refund ID ${providerRefundId} is already associated with RefundItem ${existing.id}`
+        );
+      }
+    } catch (err: any) {
+      if (err.message?.includes("CRITICAL INVARIANT VIOLATION")) throw err;
+      const demoExisting = demoPaymentStore.findRefundItemByProviderRefundId(providerRefundId);
+      if (demoExisting && demoExisting.id !== currentItemId) {
+        throw new Error(
+          `CRITICAL INVARIANT VIOLATION: Provider refund ID ${providerRefundId} is already associated with RefundItem ${demoExisting.id}`
+        );
+      }
+    }
+  }
+
+  /**
    * Executes a single planned refund item with Razorpay Normal Refund API or Mock provider.
    * Hard Invariants:
    * 1. Does not make external Razorpay call inside long-running DB transaction.
@@ -920,17 +952,7 @@ export class RefundService {
       throw new Error("Refund item has already succeeded; duplicate execution rejected");
     }
 
-    // 2. Concurrency protection: Reject if currently in-flight
-    if (refundItem.status === "PROCESSING" && !forceStatus) {
-      const timeDiff = Date.now() - new Date(refundItem.createdAt).getTime();
-      if (timeDiff < 2 * 60 * 1000) {
-        throw new Error(
-          "Refund item execution is currently in-flight; concurrent execution rejected"
-        );
-      }
-    }
-
-    // 3. Payment association and state verification
+    // 2. Payment association and provider resolution
     const payment = refundItem.payment;
     if (!payment) {
       throw new Error(`Original payment record not found for refund item ${refundItemId}`);
@@ -942,6 +964,40 @@ export class RefundService {
       throw new Error(
         `Original payment ${payment.id} status is ${payment.status}; only CAPTURED payments can be refunded`
       );
+    }
+
+    // 3. Concurrency protection: If currently in-flight, reconcile with gateway before retry
+    if (refundItem.status === "PROCESSING" && !forceStatus) {
+      const recon = await this.reconcileRefundItem({
+        refundItemId,
+        actor,
+        refundProvider: provider,
+      });
+
+      if (recon.item.status === "SUCCEEDED") {
+        return {
+          item: recon.item,
+          refund: recon.refund,
+          message: "Refund item was already processed on gateway and has been reconciled to SUCCEEDED",
+        };
+      }
+
+      if (recon.item.status === "PROCESSING") {
+        throw new Error(
+          "Refund item execution is currently in-flight; concurrent execution rejected"
+        );
+      }
+
+      if (recon.item.status === "FAILED") {
+        refundItem = recon.item;
+      } else {
+        const timeDiff = Date.now() - new Date(refundItem.createdAt).getTime();
+        if (timeDiff < 2 * 60 * 1000) {
+          throw new Error(
+            "Refund item execution is currently in-flight; concurrent execution rejected"
+          );
+        }
+      }
     }
 
     // 4. Over-refund prevention: Calculate remaining refundable amount on this payment
@@ -961,10 +1017,11 @@ export class RefundService {
       );
     }
 
-    // 5. Check Razorpay gateway-side balance if provider supports fetchPaymentRefunds
-    if (provider.providerName === "RAZORPAY" && provider.fetchPaymentRefunds && payment.providerPaymentId) {
+    // 5. Gateway-side balance verification via fetchPaymentRefunds (including Razorpay Dashboard refunds)
+    const pidToQuery = payment.providerPaymentId || payment.id;
+    if (provider.fetchPaymentRefunds && pidToQuery) {
       try {
-        const gatewayRefunds = await provider.fetchPaymentRefunds(payment.providerPaymentId);
+        const gatewayRefunds = await provider.fetchPaymentRefunds(pidToQuery);
         const gatewayRefundedPaise = gatewayRefunds
           .filter((gr: any) => gr.status === "processed" || gr.status === "created")
           .reduce((sum: bigint, gr: any) => sum + BigInt(gr.amount), 0n);
@@ -972,12 +1029,16 @@ export class RefundService {
         const gatewayRemaining = BigInt(payment.amount) - gatewayRefundedPaise;
         if (BigInt(refundItem.amount) > gatewayRemaining) {
           throw new Error(
-            `Requested refund exceeds remaining refundable balance on Razorpay gateway (gateway remaining: ${gatewayRemaining} paise)`
+            `Requested refund exceeds remaining refundable balance on Razorpay gateway (gateway remaining: ${gatewayRemaining} paise, taking into account dashboard and external refunds)`
           );
         }
       } catch (gwErr: any) {
-        // If query fails, proceed cautiously unless it was a fatal balance error
         if (gwErr.message?.includes("exceeds")) throw gwErr;
+        if (provider.providerName === "RAZORPAY") {
+          throw new Error(
+            `Unable to verify gateway refund balance from Razorpay: ${gwErr.message}. Execution aborted for safety.`
+          );
+        }
       }
     }
 
@@ -991,8 +1052,40 @@ export class RefundService {
       demoPaymentStore.updateRefundItem(refundItem.id, { status: "PROCESSING" });
     }
 
-    // 7. Stable Idempotency Key: identical on retries of the same item
-    const idempotencyKey = `refitem_${refundItem.id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    // 7. Stable Idempotency Key & Receipt Reference:
+    // Same attempt uses identical key & receipt; retry of definitive failure gets new attempt key.
+    let attemptCount = 1;
+    const cleanItemId = refundItem.id.replace(/[^a-zA-Z0-9_-]/g, "");
+    const isTimeoutOrUncertain =
+      refundItem.failureReason?.includes("TIMEOUT") ||
+      refundItem.failureReason?.includes("timeout") ||
+      refundItem.failureReason?.includes("uncertain") ||
+      refundItem.failureReason?.includes("ETIMEDOUT");
+    const isRetryAfterDefinitiveFailure =
+      refundItem.status === "FAILED" && !isTimeoutOrUncertain;
+
+    try {
+      const priorAttempts = await prisma.auditLog.count({
+        where: { entityId: refundItem.id, action: "REFUND_EXECUTION_ATTEMPT" },
+      });
+      attemptCount = isRetryAfterDefinitiveFailure ? priorAttempts + 1 : Math.max(1, priorAttempts);
+    } catch {
+      // Demo store attempt tracking
+      if (isRetryAfterDefinitiveFailure) {
+        const att = demoPaymentStore.incrementRefundItemAttempt(refundItem.id);
+        attemptCount = att.attemptCount;
+      } else {
+        const att = demoPaymentStore.getRefundItemAttempt(refundItem.id);
+        attemptCount = att.attemptCount;
+      }
+    }
+
+    const idempotencyKey =
+      attemptCount > 1 ? `refitem_${cleanItemId}_att${attemptCount}` : `refitem_${cleanItemId}`;
+    const receipt =
+      attemptCount > 1
+        ? `rfnd_${cleanItemId.slice(-8)}_a${attemptCount}`.slice(0, 40)
+        : `rfnd_${cleanItemId.slice(-8)}`.slice(0, 40);
 
     // 8. Call external Refund Provider outside DB transaction
     let providerResult: any;
@@ -1003,11 +1096,34 @@ export class RefundService {
         providerPaymentId: payment.providerPaymentId || undefined,
         amountPaise: BigInt(refundItem.amount),
         idempotencyKey,
+        receipt,
         forceStatus,
       });
     } catch (netErr: any) {
       // On uncertain network error, preserve PROCESSING status for reconciliation
       throw netErr;
+    }
+
+    // 9. Enforce Provider Refund ID Uniqueness
+    if (providerResult.providerRefundId) {
+      await this.assertUniqueProviderRefundId(providerResult.providerRefundId, refundItem.id);
+    }
+
+    // Log Execution Attempt in AuditLog
+    try {
+      await prisma.auditLog.create({
+        data: {
+          actorId: actor.userId,
+          actorEmail: actor.name,
+          actorRole: actor.role,
+          action: "REFUND_EXECUTION_ATTEMPT",
+          entityType: "RefundItem",
+          entityId: refundItem.id,
+          reason: `Execution attempt ${attemptCount} (${providerResult.status})`,
+        },
+      });
+    } catch {
+      // Offline fallback
     }
 
     // 9. Persist execution result and re-evaluate aggregate parent status
@@ -1371,6 +1487,36 @@ export class RefundService {
       };
     }
 
+    // HARD INVARIANT: Provider refund ID uniqueness across distinct executions
+    if (providerRefundId) {
+      await this.assertUniqueProviderRefundId(providerRefundId, refundItem.id);
+    }
+
+    // Detect event vs. entity inconsistency (e.g. event is refund.processed but payload entity has status: "failed")
+    const isEventProcessed = eventType === "refund.processed";
+    const isEventFailed = eventType === "refund.failed";
+    const isEntityProcessed = refundEntity?.status === "processed";
+    const isEntityFailed = refundEntity?.status === "failed";
+
+    if ((isEventProcessed && isEntityFailed) || (isEventFailed && isEntityProcessed)) {
+      const recon = await this.reconcileRefundItem({
+        refundItemId: refundItem.id,
+        actor: {
+          userId: "system_webhook",
+          name: "System Webhook",
+          role: "DIRECTOR",
+          centreIds: [],
+          linkedStudentIds: [],
+          consentedStudentIds: [],
+        },
+      });
+      return {
+        success: true,
+        status: recon.item.status,
+        refundItemId: refundItem.id,
+      };
+    }
+
     // HARD INVARIANT: Once a refund item is SUCCEEDED, out-of-order created or failed events cannot downgrade it
     if (refundItem.status === "SUCCEEDED") {
       return {
@@ -1606,6 +1752,11 @@ export class RefundService {
         refund: refundItem.refund,
         reconciled: false,
       };
+    }
+
+    // Enforce provider refund ID uniqueness
+    if (gatewayRefund.id) {
+      await this.assertUniqueProviderRefundId(gatewayRefund.id, refundItem.id);
     }
 
     // Map status from fetched gateway refund

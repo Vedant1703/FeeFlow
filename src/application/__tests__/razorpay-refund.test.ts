@@ -787,4 +787,135 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       expect(reconResult.item.providerRefundId).toBe(execResult.providerRefundId);
     });
   });
+
+  describe("Group 5: Hardened Idempotency, Concurrency & Gateway Invariant Verification", () => {
+    it("Scenario 31: Stale PROCESSING item automatically invokes reconciliation before allowing retry", async () => {
+      const mockProvider = new MockRefundProvider();
+
+      // Seed an in-flight refund item
+      demoPaymentStore.updateRefundItem("item-2", {
+        status: "PROCESSING",
+        providerRefundId: "rf_gateway_stale_1",
+      });
+
+      // Gateway already processed it
+      mockProvider.addExternalRefund({
+        id: "rf_gateway_stale_1",
+        payment_id: "pay_kavya_3",
+        amount: 3000000,
+        status: "processed",
+      });
+
+      // Calling executeRefundItem should reconcile with gateway and settle to SUCCEEDED without creating duplicate
+      const result = await refundService.executeRefundItem({
+        refundItemId: "item-2",
+        actor: accountsActor,
+        refundProvider: mockProvider,
+      });
+
+      expect(result.item.status).toBe("SUCCEEDED");
+      expect(result.message).toContain("already processed on gateway and has been reconciled to SUCCEEDED");
+    });
+
+    it("Scenario 32: Retrying a definitive FAILED item generates attempt 2 idempotency key and unique receipt", async () => {
+      const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "rfnd_retry_def_1", status: "processed", amount: 100000 }),
+      } as any);
+
+      const rzpProvider = new RazorpayRefundProvider({
+        keyId: TEST_KEY_ID,
+        keySecret: TEST_KEY_SECRET,
+      });
+
+      // Create a definitive failure (e.g. BAD_REQUEST from bank)
+      demoPaymentStore.updateRefundItem("item-3", {
+        status: "FAILED",
+        failureReason: "BAD_REQUEST_ERROR: Insufficient merchant balance",
+        attemptCount: 1,
+      });
+
+      await refundService.executeRefundItem({
+        refundItemId: "item-3",
+        actor: accountsActor,
+        refundProvider: rzpProvider,
+      });
+
+      const postCall = fetchSpy.mock.calls.find(([url, init]) => init?.method === "POST");
+      expect(postCall).toBeDefined();
+      const headers = postCall![1]?.headers as Record<string, string>;
+      const body = JSON.parse(postCall![1]?.body as string);
+
+      expect(headers["X-Refund-Idempotency"]).toBe("refitem_item-3_att2");
+      expect(body.receipt).toBe("rfnd_item-3_a2");
+    });
+
+    it("Scenario 33: Re-attempting an uncertain / timed-out execution reuses attempt 1 key without generating a new key", async () => {
+      const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "rfnd_retry_timeout_1", status: "processed", amount: 372414 }),
+      } as any);
+
+      const rzpProvider = new RazorpayRefundProvider({
+        keyId: TEST_KEY_ID,
+        keySecret: TEST_KEY_SECRET,
+      });
+
+      // Uncertain network timeout
+      demoPaymentStore.updateRefundItem("item-3", {
+        status: "FAILED",
+        failureReason: "ERR_PROVIDER_TIMEOUT: Gateway request timed out",
+      });
+
+      await refundService.executeRefundItem({
+        refundItemId: "item-3",
+        actor: accountsActor,
+        refundProvider: rzpProvider,
+      });
+
+      const postCall = fetchSpy.mock.calls.find(([url, init]) => init?.method === "POST");
+      expect(postCall).toBeDefined();
+      const headers = postCall![1]?.headers as Record<string, string>;
+      const body = JSON.parse(postCall![1]?.body as string);
+
+      expect(headers["X-Refund-Idempotency"]).toBe("refitem_item-3");
+      expect(body.receipt).toBe("rfnd_item-3");
+    });
+
+    it("Scenario 34: External Razorpay Dashboard refund is factored into fetchPaymentRefunds balance check, blocking over-refund", async () => {
+      const mockProvider = new MockRefundProvider();
+
+      // Payment pay_kavya_2 has total amount 3,000,000 paise (₹30,000) with providerPaymentId "rzp_pay_kavya_2"
+      // Simulate dashboard operator refunded 2,800,000 paise directly on Razorpay dashboard
+      mockProvider.addExternalRefund({
+        id: "rf_dashboard_external_99",
+        payment_id: "rzp_pay_kavya_2",
+        amount: 2800000,
+        status: "processed",
+      });
+
+      // Item 3 requests 372,414 paise, but only 200,000 paise remaining on gateway
+      demoPaymentStore.updateRefundItem("item-3", {
+        status: "PENDING",
+        failureReason: null,
+      });
+
+      await expect(
+        refundService.executeRefundItem({
+          refundItemId: "item-3",
+          actor: accountsActor,
+          refundProvider: mockProvider,
+        })
+      ).rejects.toThrow("Requested refund exceeds remaining refundable balance on Razorpay gateway");
+    });
+
+    it("Scenario 35: Duplicate providerRefundId assignment across two distinct RefundItems throws CRITICAL INVARIANT VIOLATION", async () => {
+      // item-1 already has providerRefundId "rf_91a"
+      await expect(
+        refundService.assertUniqueProviderRefundId("rf_91a", "item-2")
+      ).rejects.toThrow("CRITICAL INVARIANT VIOLATION");
+    });
+  });
 });
