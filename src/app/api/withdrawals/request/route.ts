@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/infrastructure/db/prisma";
 import { getSessionActor } from "@/infrastructure/auth/session";
-import { calculateProRataRefund } from "@/domain/refunds";
-import { deriveStudentLedgerSummary } from "@/domain/ledger";
+import { refundService } from "@/application/services/refund-service";
 
 export async function POST(req: Request) {
   try {
@@ -11,8 +9,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
     }
 
-    const body = await req.json();
-    const { studentId, effectiveWithdrawalDate, requestDate: rawRequestDate, notes } = body;
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON request body" }, { status: 400 });
+    }
+
+    const { studentId, effectiveWithdrawalDate, requestDate, notes } = body || {};
 
     if (!studentId || !effectiveWithdrawalDate) {
       return NextResponse.json(
@@ -21,121 +25,34 @@ export async function POST(req: Request) {
       );
     }
 
-    const requestDate = rawRequestDate ? new Date(rawRequestDate) : new Date();
-
-    try {
-      const student = await prisma.student.findUnique({
-        where: { id: studentId },
-        include: {
-          feePlans: {
-            where: { status: "ACTIVE" },
-            include: { instalments: { orderBy: { sequence: "asc" } } },
-          },
-          ledgerEntries: true,
-        },
-      });
-
-      if (student && student.feePlans.length > 0) {
-        const plan = student.feePlans[0];
-
-        // Compute live financial summary
-        const summary = deriveStudentLedgerSummary(
-          student.id,
-          plan.instalments.map((i) => ({
-            id: i.id,
-            feePlanId: i.feePlanId,
-            sequence: i.sequence,
-            dueDate: i.dueDate,
-            amount: i.amount,
-          })),
-          student.ledgerEntries.map((e) => ({ ...e, amount: e.amount })),
-          requestDate
-        );
-
-        // Calculate pro-rata refund
-        const refundCalc = calculateProRataRefund({
-          netFee: plan.netAmount,
-          totalPaid: summary.totalPaid,
-          serviceStartDate: plan.serviceStartDate,
-          serviceEndDate: plan.serviceEndDate,
-          effectiveWithdrawalDate: new Date(effectiveWithdrawalDate),
-        });
-
-        // 10-day provisional operational SLA target
-        const slaTargetDate = new Date(requestDate.getTime() + 10 * 24 * 60 * 60 * 1000);
-
-        const withdrawal = await prisma.withdrawal.create({
-          data: {
-            studentId: student.id,
-            requestDate,
-            effectiveWithdrawalDate: new Date(effectiveWithdrawalDate),
-            consumedDays: refundCalc.consumedDays,
-            totalServiceDays: refundCalc.totalServiceDays,
-            netFee: refundCalc.netFee,
-            totalPaid: refundCalc.totalPaid,
-            earnedFee: refundCalc.earnedFee,
-            deductionAmount: 0n,
-            potentialRefund: refundCalc.potentialRefund,
-            indicativeShortfall: refundCalc.indicativeShortfall,
-            slaTargetDate,
-            status: "REQUESTED",
-            requesterId: actor.userId,
-            approvalNotes: notes || "Pro-rata withdrawal quote submitted for director review",
-          },
-        });
-
-        return NextResponse.json({
-          success: true,
-          withdrawalId: withdrawal.id,
-          calculation: {
-            totalServiceDays: refundCalc.totalServiceDays,
-            consumedDays: refundCalc.consumedDays,
-            earnedFeePaise: refundCalc.earnedFee.toString(),
-            totalPaidPaise: refundCalc.totalPaid.toString(),
-            potentialRefundPaise: refundCalc.potentialRefund.toString(),
-            indicativeShortfallPaise: refundCalc.indicativeShortfall.toString(),
-            shortfallIsInformationalOnly: true,
-          },
-        });
-      }
-    } catch (dbErr) {
-      // In demo mode or offline, fallback to simulation below
-    }
-
-    // Demo mode / offline calculation fallback
-    const isIshita = studentId.toLowerCase().includes("ishita") || studentId.includes("0587");
-    const netFee = 12000000n;
-    const totalPaid = isIshita ? 4500000n : 12000000n;
-    const effDate = new Date(effectiveWithdrawalDate);
-    const sStart = new Date("2026-06-15T00:00:00Z");
-    const sEnd = new Date("2027-03-31T00:00:00Z");
-
-    const refundCalc = calculateProRataRefund({
-      netFee,
-      totalPaid,
-      serviceStartDate: sStart,
-      serviceEndDate: sEnd,
-      effectiveWithdrawalDate: effDate,
+    const result = await refundService.createWithdrawalRequest({
+      studentId,
+      effectiveWithdrawalDate,
+      requestDate,
+      notes,
+      actor,
     });
 
+    const calc = result.calculation;
     return NextResponse.json({
       success: true,
-      withdrawalId: `wth_demo_${Date.now()}`,
+      withdrawalId: result.withdrawal.id,
       calculation: {
-        totalServiceDays: refundCalc.totalServiceDays,
-        consumedDays: refundCalc.consumedDays,
-        earnedFeePaise: refundCalc.earnedFee.toString(),
-        totalPaidPaise: refundCalc.totalPaid.toString(),
-        potentialRefundPaise: refundCalc.potentialRefund.toString(),
-        indicativeShortfallPaise: refundCalc.indicativeShortfall.toString(),
+        totalServiceDays: calc.totalServiceDays,
+        consumedDays: calc.consumedDays,
+        netFeePaise: calc.netFee.toString(),
+        totalPaidPaise: calc.totalPaid.toString(),
+        earnedFeePaise: calc.earnedFee.toString(),
+        potentialRefundPaise: calc.potentialRefund.toString(),
+        indicativeShortfallPaise: calc.indicativeShortfall.toString(),
         shortfallIsInformationalOnly: true,
       },
     });
   } catch (err: any) {
+    const status = err.message?.includes("Permission denied") ? 403 : 400;
     return NextResponse.json(
       { error: err.message || "Failed to create withdrawal request" },
-      { status: 500 }
+      { status }
     );
   }
 }
-
