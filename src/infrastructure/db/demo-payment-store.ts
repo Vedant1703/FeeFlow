@@ -366,6 +366,9 @@ class DemoPaymentStore {
     const event = this.providerEvents.get(key);
     if (event) {
       event.processingStatus = status;
+      event.processed =
+        status === "ALLOCATED" || status === "UNMATCHED" || status === "FAILED";
+      event.processedAt = new Date();
       if (error) event.error = error;
     }
   }

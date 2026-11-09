@@ -134,6 +134,11 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
+    const paymentInfo =
+      intent.status === "SUCCEEDED"
+        ? await paymentService.getPaymentForOrder(orderId)
+        : null;
+
     return NextResponse.json({
       success: true,
       intent: {
@@ -149,6 +154,7 @@ export async function GET(req: Request) {
         provider: intent.provider,
         keyId: intent.keyId,
         status: intent.status,
+        receiptNumber: paymentInfo?.receiptNumber,
       },
     });
   } catch (err: any) {

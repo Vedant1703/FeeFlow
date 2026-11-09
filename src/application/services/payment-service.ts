@@ -95,6 +95,17 @@ function isPrismaConnectionError(err: any): boolean {
   );
 }
 
+let receiptCounter = 0;
+
+export function generateSequentialReceiptNumber(): string {
+  const year = new Date().getFullYear();
+  const timePart = Date.now().toString(36).toUpperCase();
+  receiptCounter = (receiptCounter + 1) % 10000;
+  const seqPart = receiptCounter.toString().padStart(4, "0");
+  const randomPart = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return `REC-${year}-${timePart}-${seqPart}-${randomPart}`;
+}
+
 export class PaymentService {
   /**
    * Helper to validate student and instalment status, and derive current ledger balance.
@@ -895,10 +906,21 @@ export class PaymentService {
     });
 
     if (existingEvent && existingEvent.processed) {
+      const existingPay = await prisma.payment.findUnique({
+        where: {
+          provider_providerPaymentId: {
+            provider: event.provider,
+            providerPaymentId: event.providerPaymentId,
+          },
+        },
+        include: { receipts: true },
+      });
       return {
         success: true,
         duplicate: true,
         status: (existingEvent.processingStatus as any) || "ALLOCATED",
+        paymentId: existingPay?.id,
+        receiptNumber: existingPay?.receipts?.[0]?.receiptNumber,
       };
     }
 
@@ -925,72 +947,97 @@ export class PaymentService {
       };
     }
 
-    // Execute within ACID transaction
-    return await prisma.$transaction(async (tx) => {
-      // Record provider event
-      await tx.providerEvent.upsert({
-        where: {
-          provider_providerEventId: {
-            provider: event.provider,
-            providerEventId: event.eventId,
-          },
-        },
-        create: {
+    // Step 1: Durable Intake — Persist event record immediately upon signature verification
+    await prisma.providerEvent.upsert({
+      where: {
+        provider_providerEventId: {
           provider: event.provider,
           providerEventId: event.eventId,
-          eventType: event.eventType,
-          payloadJson: event.rawPayload,
-          signatureVerified: true,
-          processed: true,
-          processedAt: new Date(),
-          processingStatus: event.eventType === "payment.failed" ? "FAILED" : "PENDING",
         },
-        update: {
-          processed: true,
-          processedAt: new Date(),
-        },
-      });
+      },
+      create: {
+        provider: event.provider,
+        providerEventId: event.eventId,
+        eventType: event.eventType,
+        payloadJson: event.rawPayload,
+        signatureVerified: true,
+        processed: false,
+        processingStatus: "PENDING",
+      },
+      update: {},
+    });
 
-      // Handle payment failure event
-      if (event.eventType === "payment.failed") {
-        if (event.orderId) {
-          const intent = await tx.paymentIntent.findUnique({
-            where: { orderId: event.orderId },
-          });
-          // Invariant: Never downgrade an already SUCCEEDED intent
-          if (intent && intent.status !== "SUCCEEDED") {
-            await tx.paymentIntent.update({
-              where: { id: intent.id },
-              data: { status: "FAILED" },
+    // Step 2: Execute authoritative settlement within ACID transaction
+    try {
+      return await prisma.$transaction(async (tx) => {
+        // Handle payment failure event
+        if (event.eventType === "payment.failed") {
+          if (event.orderId) {
+            const intent = await tx.paymentIntent.findUnique({
+              where: { orderId: event.orderId },
             });
+            // Invariant: Never downgrade an already SUCCEEDED intent
+            if (intent && intent.status !== "SUCCEEDED") {
+              await tx.paymentIntent.update({
+                where: { id: intent.id },
+                data: { status: "FAILED" },
+              });
+            }
           }
+
+          await tx.providerEvent.update({
+            where: {
+              provider_providerEventId: {
+                provider: event.provider,
+                providerEventId: event.eventId,
+              },
+            },
+            data: {
+              processed: true,
+              processedAt: new Date(),
+              processingStatus: "FAILED",
+            },
+          });
+
+          await recordAuditLog({
+            action: "PAYMENT_FAILED",
+            entityType: "Payment",
+            entityId: event.providerPaymentId,
+            metadata: {
+              provider: event.provider,
+              orderId: event.orderId,
+              reason: event.errorDescription || "Provider notified payment failure",
+            },
+          });
+
+          return {
+            success: true,
+            status: "FAILED",
+          };
         }
 
-        await recordAuditLog({
-          action: "PAYMENT_FAILED",
-          entityType: "Payment",
-          entityId: event.providerPaymentId,
-          metadata: {
-            provider: event.provider,
-            orderId: event.orderId,
-            reason: event.errorDescription || "Provider notified payment failure",
-          },
-        });
+        // Check if event is captured
+        if (!event.isCaptured) {
+          await tx.providerEvent.update({
+            where: {
+              provider_providerEventId: {
+                provider: event.provider,
+                providerEventId: event.eventId,
+              },
+            },
+            data: {
+              processed: true,
+              processedAt: new Date(),
+              processingStatus: "IGNORED",
+            },
+          });
 
-        return {
-          success: true,
-          status: "FAILED",
-        };
-      }
-
-      // Check if event is captured
-      if (!event.isCaptured) {
-        return {
-          success: true,
-          status: "IGNORED",
-          message: `Event ${event.eventType} is not a captured payment`,
-        };
-      }
+          return {
+            success: true,
+            status: "IGNORED",
+            message: `Event ${event.eventType} is not a captured payment`,
+          };
+        }
 
       // Order / Intent matching
       let intent: any = null;
@@ -1230,7 +1277,7 @@ export class PaymentService {
       }
 
       // Generate immutable GST demonstration receipt
-      const receiptNum = `REC-${new Date().getFullYear()}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+      const receiptNum = generateSequentialReceiptNumber();
       const receipt = await tx.receipt.create({
         data: {
           receiptNumber: receiptNum,
@@ -1257,7 +1304,11 @@ export class PaymentService {
             providerEventId: event.eventId,
           },
         },
-        data: { processingStatus: "ALLOCATED" },
+        data: {
+          processed: true,
+          processedAt: new Date(),
+          processingStatus: "ALLOCATED",
+        },
       });
 
       await recordAuditLog({
@@ -1282,6 +1333,23 @@ export class PaymentService {
         receiptNumber: receipt.receiptNumber,
       };
     });
+    } catch (err: any) {
+      try {
+        await prisma.providerEvent.update({
+          where: {
+            provider_providerEventId: {
+              provider: event.provider,
+              providerEventId: event.eventId,
+            },
+          },
+          data: {
+            processingStatus: "FAILED",
+            error: String(err.message || err),
+          },
+        });
+      } catch {}
+      throw err;
+    }
   }
 
   /**
@@ -1293,10 +1361,18 @@ export class PaymentService {
     // Level A Idempotency Check
     const existing = demoPaymentStore.findProviderEvent(event.provider, event.eventId);
     if (existing && existing.processed) {
+      const existingPayment = demoPaymentStore.findPaymentByProviderPaymentId(
+        event.provider,
+        event.providerPaymentId
+      );
+      const receipts = Array.from((demoPaymentStore as any).receipts?.values?.() || []) as any[];
+      const receipt = receipts.find((r: any) => r.paymentId === existingPayment?.id);
       return {
         success: true,
         duplicate: true,
         status: (existing.processingStatus || "ALLOCATED") as any,
+        paymentId: existingPayment?.id,
+        receiptNumber: receipt?.receiptNumber,
       };
     }
 
@@ -1490,7 +1566,7 @@ export class PaymentService {
     }
 
     // Receipt creation
-    const receiptNum = `REC-${new Date().getFullYear()}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+    const receiptNum = generateSequentialReceiptNumber();
     const receipt = demoPaymentStore.createReceipt({
       receiptNumber: receiptNum,
       paymentId: payment.id,
@@ -1544,6 +1620,58 @@ export class PaymentService {
     };
 
     return this.processNormalizedPayment(event);
+  }
+
+  /**
+   * Recovers and reprocesses uncompleted / stuck provider events after a server restart or crash.
+   * Scans for events with processed: false and signatureVerified: true.
+   */
+  async reprocessPendingProviderEvents(): Promise<number> {
+    try {
+      const pendingEvents = await prisma.providerEvent.findMany({
+        where: {
+          processed: false,
+          signatureVerified: true,
+          processingStatus: "PENDING",
+        },
+        orderBy: { createdAt: "asc" },
+      });
+
+      let reprocessed = 0;
+      for (const p of pendingEvents) {
+        try {
+          const event = this.parseWebhookPayload(
+            p.payloadJson,
+            p.provider as any,
+            p.providerEventId
+          );
+          await this.processNormalizedPayment(event);
+          reprocessed++;
+        } catch (err: any) {
+          console.error(
+            `[Recovery Error] Failed to reprocess event ${p.provider}:${p.providerEventId}: ${err.message}`
+          );
+        }
+      }
+      return reprocessed;
+    } catch {
+      // Demo store recovery fallback
+      let reprocessed = 0;
+      for (const event of demoPaymentStore.providerEvents.values()) {
+        if (!event.processed && event.signatureVerified && event.processingStatus === "PENDING") {
+          try {
+            const parsed = this.parseWebhookPayload(
+              event.payloadJson,
+              event.provider as any,
+              event.providerEventId
+            );
+            this.processNormalizedWithDemoStore(parsed);
+            reprocessed++;
+          } catch {}
+        }
+      }
+      return reprocessed;
+    }
   }
 }
 

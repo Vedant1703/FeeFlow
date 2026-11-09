@@ -11,8 +11,24 @@ export async function POST(req: Request) {
       req.headers.get("x-feeflow-signature") || req.headers.get("x-signature");
     const razorpayEventId = req.headers.get("x-razorpay-event-id");
 
+    const configuredProvider = (process.env.PAYMENT_PROVIDER || "").trim().toUpperCase();
+    const isMockAllowed =
+      process.env.NODE_ENV === "test" ||
+      (process.env.NODE_ENV === "development" && configuredProvider === "MOCK_GATEWAY");
+
+    // PRODUCTION MOCK ISOLATION: When RAZORPAY is configured or outside test/dev mock mode,
+    // mock signatures are strictly rejected and Razorpay signatures are mandatory.
+    if (configuredProvider === "RAZORPAY" || !isMockAllowed) {
+      if (!razorpaySig) {
+        return NextResponse.json(
+          { error: "Razorpay signature header (x-razorpay-signature) is required" },
+          { status: 400 }
+        );
+      }
+    }
+
     const isRazorpay = Boolean(razorpaySig);
-    const signature = razorpaySig || mockSig;
+    const signature = razorpaySig || (isMockAllowed ? mockSig : null);
     const provider = isRazorpay ? "RAZORPAY" : "MOCK_GATEWAY";
 
     const result = await paymentService.processWebhook(rawBody, {

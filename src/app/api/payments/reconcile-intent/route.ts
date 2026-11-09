@@ -8,6 +8,10 @@ const ReconcileIntentSchema = z.object({
   orderId: z.string().min(1, "Order ID is required"),
 });
 
+// Server-side in-memory cooldown cache: orderId -> timestamp ms
+const reconciliationCooldowns = new Map<string, number>();
+const RECONCILIATION_COOLDOWN_MS = 10000; // 10 seconds per order
+
 export async function POST(req: Request) {
   try {
     const actor = await getSessionActor();
@@ -59,7 +63,21 @@ export async function POST(req: Request) {
       });
     }
 
-    // 4. If CREATED or PROCESSING, fetch actual provider state using server-side credentials
+    // 4. Rate-limiting check: Prevent excessive external API calls
+    const now = Date.now();
+    const lastReconciled = reconciliationCooldowns.get(orderId) || 0;
+    if (now - lastReconciled < RECONCILIATION_COOLDOWN_MS) {
+      return NextResponse.json({
+        success: true,
+        settled: false,
+        status: intent.status,
+        orderId: intent.orderId,
+        message: "Payment confirmation is pending. Provider was queried recently.",
+      });
+    }
+    reconciliationCooldowns.set(orderId, now);
+
+    // 5. If CREATED or PROCESSING, fetch actual provider state using server-side credentials
     const provider = getPaymentProvider(intent.provider as any);
     let payments: any[] = [];
     if (typeof provider.fetchOrderPayments === "function") {

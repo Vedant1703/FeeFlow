@@ -29,7 +29,31 @@ function PaymentStatusContent() {
   const [isChecking, setIsChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
 
-  const checkStatus = React.useCallback(async () => {
+  // 1. Lightweight internal status polling (reads FeeFlow DB only, zero external Razorpay API calls)
+  const pollInternalStatus = React.useCallback(async () => {
+    if (!orderId || isChecking) return;
+    try {
+      const res = await fetch(`/api/payments/intent?orderId=${encodeURIComponent(orderId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setConfirmingPollCount((c) => c + 1);
+        if (data.success && data.intent) {
+          if (data.intent.status === "SUCCEEDED") {
+            router.replace(
+              `/parent/payment-status?status=succeeded&orderId=${encodeURIComponent(orderId)}&receipt=${encodeURIComponent(data.intent.receiptNumber || receiptNo)}`
+            );
+          } else if (data.intent.status === "FAILED") {
+            router.replace(
+              `/parent/payment-status?status=failed&orderId=${encodeURIComponent(orderId)}`
+            );
+          }
+        }
+      }
+    } catch {}
+  }, [orderId, isChecking, receiptNo, router]);
+
+  // 2. Manual reconciliation (called explicitly by user via "Check status again")
+  const manualReconcile = React.useCallback(async () => {
     if (!orderId || isChecking) return;
     setIsChecking(true);
     setCheckError(null);
@@ -64,17 +88,17 @@ function PaymentStatusContent() {
     }
   }, [orderId, isChecking, receiptNo, router]);
 
-  // Auto-poll every 3 seconds while pending (up to 10 polls)
+  // Routine background auto-poll queries ONLY internal FeeFlow database (zero external API calls)
   React.useEffect(() => {
     if (status !== "pending" || !orderId) return;
 
     if (confirmingPollCount < 10) {
       const timer = setTimeout(() => {
-        checkStatus();
+        pollInternalStatus();
       }, 3000);
       return () => clearTimeout(timer);
     }
-  }, [status, orderId, confirmingPollCount, checkStatus]);
+  }, [status, orderId, confirmingPollCount, pollInternalStatus]);
 
   return (
     <div className="min-h-screen bg-paper flex flex-col items-center">
@@ -205,7 +229,7 @@ function PaymentStatusContent() {
               <button
                 type="button"
                 disabled={isChecking}
-                onClick={() => checkStatus()}
+                onClick={() => manualReconcile()}
                 className="w-full h-11 rounded-input border border-line hover:border-teal text-ink font-semibold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 <RotateCcw className={`w-4 h-4 ${isChecking ? "animate-spin" : ""}`} />
