@@ -88,11 +88,27 @@ export interface WithdrawalCaseSummary {
  * - No items processed and every item has definitively failed: FAILED
  * - No items processed and all approved items are awaiting execution: PENDING_EXECUTION
  */
+export type AggregateRefundStatus =
+  | "PENDING_EXECUTION"
+  | "PROCESSING"
+  | "PARTIALLY_REFUNDED"
+  | "COMPLETED"
+  | "FAILED";
+
+/**
+ * Derives aggregate status of a parent Refund from its child RefundItems.
+ * State Rules (Milestone 4B):
+ * 1. All RefundItems SUCCEEDED → Parent Refund COMPLETED.
+ * 2. At least one RefundItem SUCCEEDED, while any other item is PENDING, PROCESSING or FAILED → PARTIALLY_REFUNDED.
+ * 3. No successful items, but at least one item PROCESSING → PROCESSING.
+ * 4. No successful or processing items, all items FAILED → FAILED.
+ * 5. All approved items awaiting execution → PENDING_EXECUTION.
+ */
 export function deriveRefundAggregateStatus(
   items: { status: string }[]
 ): {
-  dbStatus: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "FAILED";
-  presentationStatus: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "PARTIALLY_REFUNDED" | "FAILED";
+  dbStatus: AggregateRefundStatus;
+  presentationStatus: AggregateRefundStatus;
 } {
   if (!items || items.length === 0) {
     return { dbStatus: "PENDING_EXECUTION", presentationStatus: "PENDING_EXECUTION" };
@@ -100,26 +116,30 @@ export function deriveRefundAggregateStatus(
 
   const allSucceeded = items.every((it) => it.status === "SUCCEEDED");
   const anySucceeded = items.some((it) => it.status === "SUCCEEDED");
-  const allFailed = items.every((it) => it.status === "FAILED");
   const anyProcessing = items.some((it) => it.status === "PROCESSING");
+  const allFailed = items.every((it) => it.status === "FAILED");
 
+  // Rule 1: All RefundItems SUCCEEDED → Parent Refund COMPLETED
   if (allSucceeded) {
     return { dbStatus: "COMPLETED", presentationStatus: "COMPLETED" };
   }
 
+  // Rule 2: At least one RefundItem SUCCEEDED, while any other item is PENDING, PROCESSING or FAILED → PARTIALLY_REFUNDED
   if (anySucceeded) {
-    // Some succeeded and others failed/pending/processing -> Partially refunded
-    return { dbStatus: "PROCESSING", presentationStatus: "PARTIALLY_REFUNDED" };
+    return { dbStatus: "PARTIALLY_REFUNDED", presentationStatus: "PARTIALLY_REFUNDED" };
   }
 
-  if (allFailed) {
-    return { dbStatus: "FAILED", presentationStatus: "FAILED" };
-  }
-
+  // Rule 3: No successful items, but at least one item PROCESSING → PROCESSING
   if (anyProcessing) {
     return { dbStatus: "PROCESSING", presentationStatus: "PROCESSING" };
   }
 
+  // Rule 4: No successful or processing items, all items FAILED → FAILED
+  if (allFailed) {
+    return { dbStatus: "FAILED", presentationStatus: "FAILED" };
+  }
+
+  // Rule 5: All approved items awaiting execution → PENDING_EXECUTION
   return { dbStatus: "PENDING_EXECUTION", presentationStatus: "PENDING_EXECUTION" };
 }
 

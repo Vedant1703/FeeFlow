@@ -89,6 +89,7 @@ enum WithdrawalStatus {
 enum RefundStatus {
   PENDING_EXECUTION
   PROCESSING
+  PARTIALLY_REFUNDED
   COMPLETED
   FAILED
 }
@@ -530,7 +531,7 @@ model RefundItem {
   amount           BigInt
   status           RefundItemStatus @default(PENDING)
   failureReason    String?
-  providerRefundId String?
+  providerRefundId String?          @unique
   createdAt        DateTime         @default(now())
 
   refund  Refund  @relation(fields: [refundId], references: [id], onDelete: Cascade)

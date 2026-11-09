@@ -481,16 +481,32 @@ export default function WithdrawalsPage() {
                           {c.studentCode} · {c.batch} · {c.centre}
                         </div>
                       </div>
-                      <StatusChip
-                        tone={
-                          isApprovedOrDone
-                            ? "ok"
-                            : isRejected
-                            ? "bad"
-                            : "warn"
-                        }
-                        text={c.status}
-                      />
+                      <div className="flex flex-col items-end gap-1">
+                        <StatusChip
+                          tone={
+                            isApprovedOrDone
+                              ? "ok"
+                              : isRejected
+                              ? "bad"
+                              : "warn"
+                          }
+                          text={c.status}
+                        />
+                        {c.aggregateRefundStatus && c.aggregateRefundStatus !== "PENDING_EXECUTION" && (
+                          <StatusChip
+                            tone={
+                              c.aggregateRefundStatus === "COMPLETED"
+                                ? "ok"
+                                : c.aggregateRefundStatus === "PARTIALLY_REFUNDED"
+                                ? "info"
+                                : c.aggregateRefundStatus === "PROCESSING"
+                                ? "warn"
+                                : "bad"
+                            }
+                            text={c.aggregateRefundStatus.replace(/_/g, " ")}
+                          />
+                        )}
+                      </div>
                     </div>
 
                     <div className="mt-3 flex items-center justify-between text-xs pt-2 border-t border-line/40">
@@ -674,12 +690,13 @@ export default function WithdrawalsPage() {
                           tone={
                             selectedCase.aggregateRefundStatus === "COMPLETED"
                               ? "ok"
-                              : selectedCase.aggregateRefundStatus === "PARTIALLY_REFUNDED" ||
-                                selectedCase.aggregateRefundStatus === "PROCESSING"
+                              : selectedCase.aggregateRefundStatus === "PARTIALLY_REFUNDED"
                               ? "info"
+                              : selectedCase.aggregateRefundStatus === "PROCESSING"
+                              ? "warn"
                               : selectedCase.aggregateRefundStatus === "FAILED"
                               ? "bad"
-                              : "warn"
+                              : "slate"
                           }
                           text={selectedCase.aggregateRefundStatus.replace(/_/g, " ")}
                         />

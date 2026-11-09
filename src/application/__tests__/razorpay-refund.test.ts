@@ -7,7 +7,7 @@ import {
 } from "@/infrastructure/refunds/refund-provider";
 import { refundService, deriveRefundAggregateStatus } from "@/application/services/refund-service";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
-import { Actor } from "@/infrastructure/auth/session";
+import { Actor } from "@/application/actor";
 
 const TEST_KEY_ID = "rzp_test_feeflow_key123";
 const TEST_KEY_SECRET = "feeflow_test_secret_abc456";
@@ -377,8 +377,9 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       // Set item-2 createdAt to now so timeDiff < 2 minutes
       demoPaymentStore.updateRefundItem("item-2", {
         status: "PROCESSING",
-        createdAt: new Date(),
       });
+      const it2 = demoPaymentStore.refundItems.get("item-2");
+      if (it2) it2.createdAt = new Date();
 
       await expect(
         refundService.executeRefundItem({
@@ -418,6 +419,8 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
         unallocatedAmount: 0n,
         paymentDate: new Date(),
         method: "UPI",
+        payerDetails: "Test Parent",
+        matchStatus: "MATCHED_AUTOMATIC",
         status: "CAPTURED",
       });
 
@@ -492,7 +495,6 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       const webhook = createRefundWebhook({
         event: "refund.processed",
         refundItemId: "item-2",
-        signature: "invalid_tampered_signature_9999",
       });
 
       const res = await refundService.processRefundWebhook(webhook.rawBody, {
@@ -545,7 +547,7 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       // Parent rfnd_kavya_1 has item-1 (SUCCEEDED), item-2 (now SUCCEEDED), item-3 (FAILED)
       // Aggregate status must be PARTIALLY_REFUNDED (never FAILED!)
       const parentRefund = demoPaymentStore.getRefund("rfnd_kavya_1");
-      expect(parentRefund?.status).toBe("PROCESSING"); // In DB schema, non-final partial is PROCESSING
+      expect(parentRefund?.status).toBe("PARTIALLY_REFUNDED");
     });
 
     it("Scenario 19: refund.failed event records failure reason and leaves item retryable", async () => {
@@ -665,7 +667,7 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       ];
       const agg = deriveRefundAggregateStatus(items);
       expect(agg.presentationStatus).toBe("PARTIALLY_REFUNDED");
-      expect(agg.dbStatus).toBe("PROCESSING"); // In-flight DB status
+      expect(agg.dbStatus).toBe("PARTIALLY_REFUNDED");
     });
 
     it("Scenario 25: retrying failed item transitions it to SUCCEEDED and advances parent to COMPLETED", async () => {
@@ -814,7 +816,7 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       });
 
       expect(result.item.status).toBe("SUCCEEDED");
-      expect(result.message).toContain("already processed on gateway and has been reconciled to SUCCEEDED");
+      expect((result as any).message).toContain("already processed on gateway and has been reconciled to SUCCEEDED");
     });
 
     it("Scenario 32: Retrying a definitive FAILED item generates attempt 2 idempotency key and unique receipt", async () => {
@@ -916,6 +918,110 @@ describe("Milestone 4B: Razorpay Normal Refund API Integration (30 Scenarios)", 
       await expect(
         refundService.assertUniqueProviderRefundId("rf_91a", "item-2")
       ).rejects.toThrow("CRITICAL INVARIANT VIOLATION");
+    });
+  });
+
+  // =========================================================================
+  // GROUP 6: PARENT REFUND AGGREGATE STATUS REGRESSION SUITE (SCENARIOS 36–43)
+  // =========================================================================
+
+  describe("Group 6: Parent Refund Aggregate Status Regression Suite", () => {
+    it("Scenario 36: one succeeded + one pending -> PARTIALLY_REFUNDED", () => {
+      const items = [{ status: "SUCCEEDED" }, { status: "PENDING" }];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("PARTIALLY_REFUNDED");
+      expect(agg.presentationStatus).toBe("PARTIALLY_REFUNDED");
+    });
+
+    it("Scenario 37: one succeeded + one processing -> PARTIALLY_REFUNDED", () => {
+      const items = [{ status: "SUCCEEDED" }, { status: "PROCESSING" }];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("PARTIALLY_REFUNDED");
+      expect(agg.presentationStatus).toBe("PARTIALLY_REFUNDED");
+    });
+
+    it("Scenario 38: one succeeded + one failed -> PARTIALLY_REFUNDED (failed sibling never erases success)", () => {
+      const items = [{ status: "SUCCEEDED" }, { status: "FAILED" }];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("PARTIALLY_REFUNDED");
+      expect(agg.presentationStatus).toBe("PARTIALLY_REFUNDED");
+    });
+
+    it("Scenario 39: all succeeded -> COMPLETED", () => {
+      const items = [
+        { status: "SUCCEEDED" },
+        { status: "SUCCEEDED" },
+        { status: "SUCCEEDED" },
+      ];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("COMPLETED");
+      expect(agg.presentationStatus).toBe("COMPLETED");
+    });
+
+    it("Scenario 40: all failed -> FAILED", () => {
+      const items = [{ status: "FAILED" }, { status: "FAILED" }];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("FAILED");
+      expect(agg.presentationStatus).toBe("FAILED");
+    });
+
+    it("Scenario 41: all pending -> PENDING_EXECUTION", () => {
+      const items = [{ status: "PENDING" }, { status: "PENDING" }, { status: "PENDING" }];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("PENDING_EXECUTION");
+      expect(agg.presentationStatus).toBe("PENDING_EXECUTION");
+    });
+
+    it("Scenario 42: multiple successful items with one remaining pending -> PARTIALLY_REFUNDED", () => {
+      const items = [
+        { status: "SUCCEEDED" },
+        { status: "SUCCEEDED" },
+        { status: "PENDING" },
+      ];
+      const agg = deriveRefundAggregateStatus(items);
+      expect(agg.dbStatus).toBe("PARTIALLY_REFUNDED");
+      expect(agg.presentationStatus).toBe("PARTIALLY_REFUNDED");
+    });
+
+    it("Scenario 43: duplicate refund webhook does not change aggregate state incorrectly", async () => {
+      // In seed: rfnd_kavya_1 has item-1 (SUCCEEDED), item-2 (PROCESSING), item-3 (FAILED)
+      const initialRefundItems = demoPaymentStore.getRefundItemsByRefundId("rfnd_kavya_1");
+      const initialAggregate = deriveRefundAggregateStatus(initialRefundItems);
+      expect(initialAggregate.dbStatus).toBe("PARTIALLY_REFUNDED");
+
+      // Deliver duplicate webhook for already SUCCEEDED item-1
+      const rawPayload = JSON.stringify({
+        event: "refund.processed",
+        id: "evt_dup_test_agg_1",
+        account_id: "acc_test",
+        payload: {
+          refund: {
+            entity: {
+              id: "rf_91a",
+              payment_id: "pay_kavya_4",
+              amount: 3000000,
+              currency: "INR",
+              status: "processed",
+              notes: { refundItemId: "item-1" },
+            },
+          },
+        },
+      });
+
+      const res = await refundService.processRefundWebhook(rawPayload, {
+        provider: "MOCK_GATEWAY",
+        signature: "valid_sig",
+        eventId: "evt_dup_test_agg_1",
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.duplicate).toBe(true);
+
+      // Verify parent aggregate status is still PARTIALLY_REFUNDED
+      const postRefundItems = demoPaymentStore.getRefundItemsByRefundId("rfnd_kavya_1");
+      const postAggregate = deriveRefundAggregateStatus(postRefundItems);
+      expect(postAggregate.dbStatus).toBe("PARTIALLY_REFUNDED");
+      expect(postAggregate.presentationStatus).toBe("PARTIALLY_REFUNDED");
     });
   });
 });

@@ -109,7 +109,7 @@ export interface DemoRefund {
   withdrawalId: string;
   studentId: string;
   totalApprovedAmount: bigint;
-  status: "PENDING_EXECUTION" | "PROCESSING" | "COMPLETED" | "FAILED";
+  status: "PENDING_EXECUTION" | "PROCESSING" | "PARTIALLY_REFUNDED" | "COMPLETED" | "FAILED";
   createdAt: Date;
   completedAt?: Date | null;
 }
