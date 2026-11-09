@@ -77,7 +77,7 @@ export interface DemoReminder {
   instalmentId: string;
   studentId: string;
   scheduledDate: Date;
-  status: "QUEUED" | "SENT" | "SKIPPED" | "CANCELLED" | "FAILED";
+  status: "QUEUED" | "SENT" | "SKIPPED" | "CANCELLED" | "FAILED" | "PROCESSING";
   skipReason?: string;
   ruleName?: string;
   channel?: "WHATSAPP" | "SMS";
@@ -87,6 +87,9 @@ export interface DemoReminder {
   lastAttemptAt?: Date | null;
   dispatchedAt?: Date | null;
   renderedMessage?: string | null;
+  claimId?: string | null;
+  claimedAt?: Date | null;
+  isAmbiguousTimeout?: boolean;
 }
 
 export interface DemoReminderAttempt {
@@ -1286,6 +1289,89 @@ class DemoPaymentStore {
     };
     this.reminderAttempts.push(rec);
     return rec;
+  }
+
+  /**
+   * Atomically claims a reminder for dispatch or retry.
+   * Ensures only one instance can claim a reminder.
+   * Persists claimId and sets status to "PROCESSING".
+   */
+  claimReminder(
+    reminderId: string,
+    expectedStatus: "QUEUED" | "FAILED",
+    claimId: string
+  ): { success: boolean; reminder?: DemoReminder; error?: string } {
+    const reminder = this.reminders.find((r) => r.id === reminderId);
+    if (!reminder) {
+      return { success: false, error: `Reminder not found: ${reminderId}` };
+    }
+
+    if (reminder.status === "SENT") {
+      return { success: false, error: "Cannot re-send already dispatched reminder" };
+    }
+
+    if (reminder.status === "PROCESSING" || reminder.claimId) {
+      if (reminder.isAmbiguousTimeout) {
+        return {
+          success: false,
+          error:
+            "Reminder is in an ambiguous unconfirmed state (provider timeout). Manual reconciliation required before retry.",
+        };
+      }
+      return {
+        success: false,
+        error: `Reminder ${reminderId} is currently claimed by instance claim ${reminder.claimId}`,
+      };
+    }
+
+    if (reminder.status !== expectedStatus) {
+      return {
+        success: false,
+        error: `Reminder ${reminderId} status is ${reminder.status}, expected ${expectedStatus}`,
+      };
+    }
+
+    reminder.status = "PROCESSING";
+    reminder.claimId = claimId;
+    reminder.claimedAt = new Date();
+    reminder.isAmbiguousTimeout = false;
+
+    return { success: true, reminder };
+  }
+
+  /**
+   * Releases or completes an active claim on a reminder.
+   */
+  releaseClaim(
+    reminderId: string,
+    claimId: string,
+    resolution: {
+      status: "SENT" | "FAILED" | "SKIPPED" | "PROCESSING";
+      error?: string | null;
+      skipReason?: string | null;
+      renderedMessage?: string | null;
+      dispatchedAt?: Date | null;
+      isAmbiguousTimeout?: boolean;
+    }
+  ): void {
+    const reminder = this.reminders.find((r) => r.id === reminderId);
+    if (!reminder) return;
+
+    if (reminder.claimId && reminder.claimId !== claimId) {
+      return;
+    }
+
+    reminder.status = resolution.status;
+    if (resolution.status !== "PROCESSING") {
+      reminder.claimId = null;
+      reminder.claimedAt = null;
+    }
+    if (resolution.error !== undefined) reminder.lastError = resolution.error;
+    if (resolution.skipReason !== undefined)
+      reminder.skipReason = resolution.skipReason ?? undefined;
+    if (resolution.renderedMessage !== undefined) reminder.renderedMessage = resolution.renderedMessage;
+    if (resolution.dispatchedAt !== undefined) reminder.dispatchedAt = resolution.dispatchedAt;
+    if (resolution.isAmbiguousTimeout !== undefined) reminder.isAmbiguousTimeout = resolution.isAmbiguousTimeout;
   }
 
   getAttemptsForReminder(reminderId: string): DemoReminderAttempt[] {

@@ -38,12 +38,13 @@ interface ReminderRecord {
   channel: "SMS" | "WHATSAPP";
   language: "en" | "hi";
   evaluatedAmountPaise: string;
-  status: "QUEUED" | "SENT" | "FAILED" | "SKIPPED";
+  status: "QUEUED" | "SENT" | "FAILED" | "SKIPPED" | "PROCESSING";
   scheduledFor: string;
   dispatchedAt?: string | null;
   skipReason?: string | null;
   lastError?: string | null;
   attemptCount: number;
+  isAmbiguousTimeout?: boolean;
 }
 
 interface ReminderAttempt {
@@ -253,6 +254,8 @@ export default function ReminderCentrePage() {
       case "SENT":
         return "ok";
       case "QUEUED":
+        return "warn";
+      case "PROCESSING":
         return "warn";
       case "FAILED":
         return "bad";

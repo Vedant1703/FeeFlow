@@ -1,16 +1,18 @@
 /**
  * Application Reminder Service for FeeFlow.
  * Handles reminder queries, live-balance dispatch, failure recording, retries,
- * and delivery history tracking with strict financial invariants.
+ * and delivery history tracking with strict financial invariants and database-backed claiming.
  *
  * Hard Invariants:
- * 1. Live Balance at Dispatch: Never trust queued amounts; always re-evaluate
- *    current ledger balance via deriveInstalmentBalance().
- * 2. Stop on Full Settlement: If outstanding balance <= 0n, suppress dispatch
+ * 1. Persistent Atomic Claiming: Atomically claim a reminder before provider invocation;
+ *    only one server instance can claim a reminder for dispatch or retry.
+ * 2. Live Balance at Dispatch: Never trust queued amounts; always re-evaluate
+ *    current ledger balance via deriveInstalmentBalance() immediately before dispatch.
+ * 3. Stop on Full Settlement: If outstanding balance <= 0n, suppress dispatch
  *    and mark reminder as SKIPPED.
- * 3. Stop on Withdrawal / Pause: Withdrawn students or active pauses suppress dispatch.
- * 4. Partial Payment Quotes: Rendered messages always quote the exact live remaining balance.
- * 5. Idempotent & Concurrency Safe: Concurrent dispatch attempts never send twice.
+ * 4. Stop on Withdrawal / Pause: Withdrawn students or active pauses suppress dispatch.
+ * 5. Ambiguous Timeout Safety: Provider network timeouts retain an explicit uncertain
+ *    state (PROCESSING) and are never blindly auto-retried without confirmation.
  * 6. Non-Duplicable Success: Successful (SENT) reminders can never be re-dispatched.
  * 7. RBAC Enforced: Accounts staff are strictly scoped to their assigned centres;
  *    Director has cross-centre access.
@@ -30,7 +32,7 @@ import { Actor } from "@/application/actor";
 import { getDefaultClock } from "@/domain/clock";
 
 export interface ListRemindersFilter {
-  status?: "QUEUED" | "SENT" | "SKIPPED" | "FAILED" | "ALL";
+  status?: "QUEUED" | "SENT" | "SKIPPED" | "FAILED" | "PROCESSING" | "ALL";
   centreId?: string;
   dateFrom?: string;
   dateTo?: string;
@@ -52,12 +54,13 @@ export interface ReminderListItem {
   channel: "WHATSAPP" | "SMS";
   language: "en" | "hi";
   evaluatedAmountPaise: bigint;
-  status: "QUEUED" | "SENT" | "SKIPPED" | "FAILED";
+  status: "QUEUED" | "SENT" | "SKIPPED" | "FAILED" | "PROCESSING";
   scheduledFor: Date;
   dispatchedAt?: Date | null;
   skipReason?: string | null;
   lastError?: string | null;
   attemptCount: number;
+  isAmbiguousTimeout?: boolean;
 }
 
 export interface ReminderDetails {
@@ -71,12 +74,13 @@ export interface ReminderDetails {
 
 export interface DispatchReminderResult {
   success: boolean;
-  status: "SENT" | "SKIPPED" | "FAILED";
+  status: "SENT" | "SKIPPED" | "FAILED" | "PROCESSING";
   messageId?: string;
   skipReason?: string;
   error?: string;
   currentOutstandingPaise: bigint;
   renderedMessage?: string;
+  isAmbiguousTimeout?: boolean;
 }
 
 export class ReminderService {
@@ -270,15 +274,14 @@ export class ReminderService {
         channel: r.channel || "WHATSAPP",
         language: r.language || "en",
         evaluatedAmountPaise:
-          r.status === "SENT" && sentAmount !== undefined
-            ? sentAmount
-            : liveOutstanding,
+          r.status === "SENT" && sentAmount !== undefined ? sentAmount : liveOutstanding,
         status: r.status as any,
         scheduledFor: r.scheduledDate,
         dispatchedAt: r.dispatchedAt,
         skipReason: r.skipReason,
         lastError: r.lastError,
         attemptCount: r.attemptCount || (r.status === "SENT" ? 1 : 0),
+        isAmbiguousTimeout: r.isAmbiguousTimeout,
       });
     }
 
@@ -354,6 +357,7 @@ export class ReminderService {
     });
 
     const attempts = demoPaymentStore.getAttemptsForReminder(reminderId);
+    const sentAmount = attempts.find((a) => a.status === "SENT")?.evaluatedAmountPaise;
 
     const item: ReminderListItem = {
       id: reminder.id,
@@ -370,8 +374,8 @@ export class ReminderService {
       channel: reminder.channel || "WHATSAPP",
       language: reminder.language || "en",
       evaluatedAmountPaise:
-        reminder.status === "SENT" && attempts.find((a) => a.status === "SENT")?.evaluatedAmountPaise !== undefined
-          ? attempts.find((a) => a.status === "SENT")!.evaluatedAmountPaise
+        reminder.status === "SENT" && sentAmount !== undefined
+          ? sentAmount
           : liveOutstanding,
       status: reminder.status as any,
       scheduledFor: reminder.scheduledDate,
@@ -379,6 +383,7 @@ export class ReminderService {
       skipReason: reminder.skipReason,
       lastError: reminder.lastError,
       attemptCount: reminder.attemptCount || attempts.length,
+      isAmbiguousTimeout: reminder.isAmbiguousTimeout,
     };
 
     return {
@@ -405,8 +410,9 @@ export class ReminderService {
 
   /**
    * Dispatches an eligible queued reminder.
-   * Enforces live balance re-evaluation, stop-on-settlement, stop-on-withdrawal,
-   * idempotency locking, and audit recording.
+   * Atomically claims the reminder using database/store persistence,
+   * re-evaluates live ledger balance, checks stop-on-settlement/withdrawal,
+   * invokes notification provider, and handles ambiguous timeouts.
    */
   public async dispatchReminder(
     reminderId: string,
@@ -432,11 +438,80 @@ export class ReminderService {
       throw new Error("Cannot re-send already dispatched reminder");
     }
 
-    // In-process Concurrency Lock
-    if (demoPaymentStore.dispatchingReminders.has(reminderId)) {
-      throw new Error(`Concurrent dispatch in progress for reminder: ${reminderId}`);
+    // Atomic claim with persistent record
+    const claimId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const claimResult = demoPaymentStore.claimReminder(reminderId, "QUEUED", claimId);
+    if (!claimResult.success) {
+      throw new Error(claimResult.error || `Unable to claim reminder ${reminderId} for dispatch`);
     }
-    demoPaymentStore.dispatchingReminders.add(reminderId);
+
+    return this.executeClaimedDispatch(
+      reminderId,
+      claimId,
+      student,
+      reminder,
+      actor,
+      idempotencyKey
+    );
+  }
+
+  /**
+   * Retries dispatch for a failed reminder.
+   * Atomically claims the reminder with expected status FAILED,
+   * re-evaluates live ledger balance, and prevents blind retries on ambiguous timeouts.
+   */
+  public async retryReminder(
+    reminderId: string,
+    actor: Actor,
+    idempotencyKey?: string
+  ): Promise<DispatchReminderResult> {
+    this.checkStaffAccess(actor);
+
+    const reminder = demoPaymentStore.findReminderById(reminderId);
+    if (!reminder) {
+      throw new Error(`Reminder not found: ${reminderId}`);
+    }
+
+    const student = demoPaymentStore.getStudent(reminder.studentId);
+    if (!student) {
+      throw new Error(`Student not found for reminder: ${reminder.studentId}`);
+    }
+
+    this.checkStaffAccess(actor, student.centreId);
+
+    if (reminder.status === "SENT") {
+      throw new Error("Cannot re-send already dispatched reminder");
+    }
+
+    // Atomic claim for retry (requires FAILED status; blocks ambiguous timeout / processing)
+    const claimId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const claimResult = demoPaymentStore.claimReminder(reminderId, "FAILED", claimId);
+    if (!claimResult.success) {
+      throw new Error(claimResult.error || `Unable to claim reminder ${reminderId} for retry`);
+    }
+
+    return this.executeClaimedDispatch(
+      reminderId,
+      claimId,
+      student,
+      reminder,
+      actor,
+      idempotencyKey
+    );
+  }
+
+  /**
+   * Shared dispatch execution lifecycle after atomic claim is acquired.
+   */
+  private async executeClaimedDispatch(
+    reminderId: string,
+    claimId: string,
+    student: any,
+    reminder: any,
+    actor: Actor,
+    idempotencyKey?: string
+  ): Promise<DispatchReminderResult> {
+    let claimResolved = false;
 
     try {
       const clock = getDefaultClock();
@@ -447,7 +522,7 @@ export class ReminderService {
         throw new Error(`Instalment not found: ${reminder.instalmentId}`);
       }
 
-      // Financial Invariant: Re-derive LIVE ledger balance at dispatch time
+      // Financial Invariant: Re-derive LIVE ledger balance immediately before dispatch
       const studentLedgers = demoPaymentStore.ledgerEntries.filter(
         (e) => e.studentId === student.id
       );
@@ -473,10 +548,11 @@ export class ReminderService {
 
       // If not eligible (settled in full, withdrawn, paused): Auto-skip immediately
       if (!eligibility.isEligible) {
-        demoPaymentStore.updateReminder(reminderId, {
+        demoPaymentStore.releaseClaim(reminderId, claimId, {
           status: "SKIPPED",
           skipReason: eligibility.skipReason || "Ineligible for dispatch",
         });
+        claimResolved = true;
 
         demoPaymentStore.recordReminderAttempt({
           reminderId,
@@ -508,8 +584,11 @@ export class ReminderService {
         };
       }
 
-      // Dispatch via notification provider
+      // Get notification provider (fails closed in production if unconfigured)
       const provider = getNotificationProvider();
+      const providerIdempotencyKey =
+        idempotencyKey || `feeflow_rem_${reminderId}_${claimId}`;
+
       const providerResult = await provider.sendFeeReminder({
         phone: student.parentPhone || "+91 99999 99999",
         subject: eligibility.renderedSubject || "Fee Reminder",
@@ -518,16 +597,65 @@ export class ReminderService {
         studentName: student.name,
         studentCode: student.studentCode,
         amountPaise: liveOutstanding,
-        idempotencyKey: idempotencyKey || `rem_${reminderId}_${Date.now()}`,
+        idempotencyKey: providerIdempotencyKey,
       });
 
       const nextAttemptNumber = (reminder.attemptCount || 0) + 1;
 
+      // Handle Ambiguous Provider Timeout
+      if (providerResult.isAmbiguousTimeout) {
+        demoPaymentStore.releaseClaim(reminderId, claimId, {
+          status: "PROCESSING",
+          isAmbiguousTimeout: true,
+          error: providerResult.error,
+        });
+        claimResolved = true;
+
+        demoPaymentStore.recordReminderAttempt({
+          reminderId,
+          attemptNumber: nextAttemptNumber,
+          status: "FAILED",
+          error: providerResult.error,
+          evaluatedAmountPaise: liveOutstanding,
+          provider: providerResult.provider,
+          attemptedAt: providerResult.sentAt,
+        });
+
+        await recordAuditLog({
+          action: "REMINDER_DISPATCH_TIMEOUT",
+          entityType: "Reminder",
+          entityId: reminderId,
+          actorId: actor.userId,
+          actorRole: actor.role,
+          centreId: student.centreId,
+          reason: providerResult.error,
+          metadata: {
+            studentCode: student.studentCode,
+            amountPaise: liveOutstanding.toString(),
+            ambiguousTimeout: true,
+          },
+        });
+
+        return {
+          success: false,
+          status: "PROCESSING",
+          error: providerResult.error,
+          currentOutstandingPaise: liveOutstanding,
+          isAmbiguousTimeout: true,
+        };
+      }
+
       if (providerResult.success) {
-        demoPaymentStore.updateReminder(reminderId, {
+        demoPaymentStore.releaseClaim(reminderId, claimId, {
           status: "SENT",
           dispatchedAt: providerResult.sentAt,
           renderedMessage: eligibility.renderedBody,
+          isAmbiguousTimeout: false,
+          error: null,
+        });
+        claimResolved = true;
+
+        demoPaymentStore.updateReminder(reminderId, {
           attemptCount: nextAttemptNumber,
           lastError: null,
         });
@@ -564,9 +692,15 @@ export class ReminderService {
           renderedMessage: eligibility.renderedBody,
         };
       } else {
-        demoPaymentStore.updateReminder(reminderId, {
+        // Definitive Provider Failure
+        demoPaymentStore.releaseClaim(reminderId, claimId, {
           status: "FAILED",
-          lastError: providerResult.error,
+          error: providerResult.error,
+          isAmbiguousTimeout: false,
+        });
+        claimResolved = true;
+
+        demoPaymentStore.updateReminder(reminderId, {
           attemptCount: nextAttemptNumber,
           lastAttemptAt: providerResult.sentAt,
         });
@@ -603,33 +737,13 @@ export class ReminderService {
         };
       }
     } finally {
-      demoPaymentStore.dispatchingReminders.delete(reminderId);
+      if (!claimResolved) {
+        demoPaymentStore.releaseClaim(reminderId, claimId, {
+          status: "FAILED",
+          error: "Dispatch interrupted unexpectedly",
+        });
+      }
     }
-  }
-
-  /**
-   * Retries dispatch for a failed reminder.
-   * Re-evaluates live ledger balance, ensures previous state was FAILED,
-   * enforces concurrency protection, and handles provider recovery.
-   */
-  public async retryReminder(
-    reminderId: string,
-    actor: Actor,
-    idempotencyKey?: string
-  ): Promise<DispatchReminderResult> {
-    this.checkStaffAccess(actor);
-
-    const reminder = demoPaymentStore.findReminderById(reminderId);
-    if (!reminder) {
-      throw new Error(`Reminder not found: ${reminderId}`);
-    }
-
-    if (reminder.status === "SENT") {
-      throw new Error("Cannot re-send already dispatched reminder");
-    }
-
-    // Call dispatchReminder which handles the full re-evaluation, locking, and recording lifecycle
-    return this.dispatchReminder(reminderId, actor, idempotencyKey);
   }
 }
 

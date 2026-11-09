@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { reminderService } from "@/application/services/reminder-service";
+import { reminderService, ReminderService } from "@/application/services/reminder-service";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
-import { mockNotificationProvider } from "@/infrastructure/notifications/notification-provider";
+import {
+  mockNotificationProvider,
+  getNotificationProvider,
+} from "@/infrastructure/notifications/notification-provider";
 import { Actor } from "@/application/actor";
 
 describe("Milestone 5B: Reminder Operations & Dispatch Integrity", () => {
@@ -182,7 +185,9 @@ describe("Milestone 5B: Reminder Operations & Dispatch Integrity", () => {
     // Exactly one must succeed, or the second is rejected by concurrency lock
     if (rejected.length > 0) {
       expect(rejected[0].status).toBe("rejected");
-      expect((rejected[0] as PromiseRejectedResult).reason.message).toContain("Concurrent dispatch in progress");
+      expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
+        /currently claimed|Concurrent dispatch in progress/i
+      );
       expect(fulfilled.length).toBe(1);
     } else {
       // If run sequentially in microtasks, second must reject because status became SENT
@@ -284,5 +289,142 @@ describe("Milestone 5B: Reminder Operations & Dispatch Integrity", () => {
     expect(updatedDetails.reminder.attemptCount).toBe(4);
     expect(updatedDetails.attempts.length).toBe(4);
     expect(updatedDetails.attempts[0].status).toBe("SENT");
+  });
+
+  // Scenario 11: Two concurrent dispatch requests across separate service instances
+  it("Scenario 11: two concurrent dispatch requests against the same reminder across separate service instances result in at most one provider invocation", async () => {
+    const serviceA = new ReminderService();
+    const serviceB = new ReminderService();
+    const reminderId = "rem_mohit_inst1";
+
+    const [resA, resB] = await Promise.allSettled([
+      serviceA.dispatchReminder(reminderId, directorActor),
+      serviceB.dispatchReminder(reminderId, directorActor),
+    ]);
+
+    const fulfilled = [resA, resB].filter((r) => r.status === "fulfilled");
+    const rejected = [resA, resB].filter((r) => r.status === "rejected");
+
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
+      /currently claimed|Concurrent dispatch in progress/i
+    );
+
+    // Provider must be invoked at most once
+    expect(mockNotificationProvider.sentHistory.length).toBe(1);
+  });
+
+  // Scenario 12: Concurrent retry requests cannot dispatch the same failed reminder twice
+  it("Scenario 12: concurrent retry requests cannot dispatch the same failed reminder twice", async () => {
+    const serviceA = new ReminderService();
+    const serviceB = new ReminderService();
+    const reminderId = "rem_dev_failed"; // Seeded with status FAILED
+
+    const [resA, resB] = await Promise.allSettled([
+      serviceA.retryReminder(reminderId, directorActor),
+      serviceB.retryReminder(reminderId, directorActor),
+    ]);
+
+    const fulfilled = [resA, resB].filter((r) => r.status === "fulfilled");
+    const rejected = [resA, resB].filter((r) => r.status === "rejected");
+
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
+      /currently claimed|Concurrent dispatch in progress/i
+    );
+
+    // Provider invoked exactly once for the retry
+    expect(mockNotificationProvider.sentHistory.length).toBe(1);
+  });
+
+  // Scenario 13: Process restart or stale dispatch claim does not cause blind duplicate delivery
+  it("Scenario 13: process restart with an active or stale dispatch claim does not cause blind duplicate delivery", async () => {
+    const reminderId = "rem_mohit_inst1";
+
+    // Simulate a previous server instance that claimed the reminder (status PROCESSING, claimId set) and crashed/restarted
+    demoPaymentStore.updateReminder(reminderId, {
+      status: "PROCESSING",
+      claimId: "claim_crashed_instance_8921",
+      claimedAt: new Date(Date.now() - 10 * 60 * 1000), // 10 minutes ago
+    });
+
+    // A brand new service instance starts up after restart
+    const newServiceInstance = new ReminderService();
+
+    // Attempting to dispatch must reject safely without calling the provider
+    await expect(
+      newServiceInstance.dispatchReminder(reminderId, directorActor)
+    ).rejects.toThrow(/currently claimed|in progress|ambiguous/i);
+
+    // Attempting to retry must also reject safely
+    await expect(
+      newServiceInstance.retryReminder(reminderId, directorActor)
+    ).rejects.toThrow(/currently claimed|expected FAILED|in progress|ambiguous/i);
+
+    expect(mockNotificationProvider.sentHistory.length).toBe(0);
+  });
+
+  // Scenario 14: Ambiguous provider timeout is not automatically retried
+  it("Scenario 14: ambiguous provider timeout enters uncertain state and is not automatically retried", async () => {
+    const reminderId = "rem_mohit_inst1";
+
+    // Configure provider to return an ambiguous network timeout
+    mockNotificationProvider.setAmbiguousTimeoutNext(
+      1,
+      "Gateway timeout (HTTP 504): delivery unconfirmed"
+    );
+
+    const result = await reminderService.dispatchReminder(reminderId, directorActor);
+
+    expect(result.success).toBe(false);
+    expect(result.isAmbiguousTimeout).toBe(true);
+    expect(result.status).toBe("PROCESSING");
+
+    const reminder = demoPaymentStore.findReminderById(reminderId);
+    expect(reminder?.status).toBe("PROCESSING");
+    expect(reminder?.isAmbiguousTimeout).toBe(true);
+
+    // Subsequent dispatch attempt must reject without calling provider
+    await expect(
+      reminderService.dispatchReminder(reminderId, directorActor)
+    ).rejects.toThrow(/ambiguous unconfirmed state/i);
+
+    // Subsequent retry attempt must also reject without calling provider
+    await expect(
+      reminderService.retryReminder(reminderId, directorActor)
+    ).rejects.toThrow(/ambiguous unconfirmed state/i);
+
+    // Provider was called only once during initial attempt, zero blind retries
+    expect(mockNotificationProvider.sentHistory.length).toBe(1);
+  });
+
+  // Scenario 15: Production configuration cannot select MockNotificationProvider
+  it("Scenario 15: production configuration fails closed and cannot select MockNotificationProvider", () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalDemoMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+    const originalMockFlag = process.env.FEEFLOW_USE_MOCK_NOTIFICATIONS;
+
+    try {
+      (process.env as any).NODE_ENV = "production";
+      delete process.env.NEXT_PUBLIC_DEMO_MODE;
+      delete process.env.FEEFLOW_USE_MOCK_NOTIFICATIONS;
+
+      expect(() => getNotificationProvider()).toThrow(
+        /Production notification provider is not configured|MockNotificationProvider is disabled in production/i
+      );
+    } finally {
+      (process.env as any).NODE_ENV = originalNodeEnv;
+      if (originalDemoMode !== undefined) process.env.NEXT_PUBLIC_DEMO_MODE = originalDemoMode;
+      if (originalMockFlag !== undefined) process.env.FEEFLOW_USE_MOCK_NOTIFICATIONS = originalMockFlag;
+    }
+  });
+
+  // Scenario 16: Explicit demo/test configuration still supports existing mock-provider tests
+  it("Scenario 16: explicit demo/test configuration correctly provides MockNotificationProvider", () => {
+    const provider = getNotificationProvider();
+    expect(provider).toBeDefined();
+    expect(provider.name).toBe("MOCK_NOTIFICATION_PROVIDER");
   });
 });
