@@ -18,6 +18,8 @@ dist/
 /design-assets
 *.pdf
 *.zip
+!TDD.pdf
+!feeflow-submission.zip
 
 # Logs & debugging
 *.tsbuildinfo
