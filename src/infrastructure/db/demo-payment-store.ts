@@ -128,6 +128,30 @@ export interface DemoRefundItem {
   lastReceipt?: string;
 }
 
+export interface DemoStudent {
+  id: string;
+  studentCode: string;
+  name: string;
+  centreId: string;
+  centreName: string;
+  parentPhone?: string | null;
+}
+
+export interface DemoAuditLog {
+  id: string;
+  actorId: string;
+  actorEmail: string;
+  actorRole: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  centreId?: string | null;
+  reason?: string | null;
+  beforeJson?: string | null;
+  afterJson?: string | null;
+  createdAt: Date;
+}
+
 class DemoPaymentStore {
   public intents: Map<string, DemoPaymentIntent> = new Map();
   public providerEvents: Map<string, DemoProviderEvent> = new Map();
@@ -140,6 +164,8 @@ class DemoPaymentStore {
   public withdrawals: Map<string, DemoWithdrawal> = new Map();
   public refunds: Map<string, DemoRefund> = new Map();
   public refundItems: Map<string, DemoRefundItem> = new Map();
+  public students: Map<string, DemoStudent> = new Map();
+  public auditLogs: DemoAuditLog[] = [];
 
   constructor() {
     this.reset();
@@ -157,6 +183,8 @@ class DemoPaymentStore {
     this.withdrawals.clear();
     this.refunds.clear();
     this.refundItems.clear();
+    this.students.clear();
+    this.auditLogs = [];
 
     this.seedDefaultData();
   }
@@ -171,6 +199,15 @@ class DemoPaymentStore {
     const inst2Id = "inst_ishita_2";
     const inst3Id = "inst_ishita_3";
     const inst4Id = "inst_ishita_4";
+
+    this.students.set(ishitaId, {
+      id: ishitaId,
+      studentCode: "STU-0587",
+      name: "Ishita Sharma",
+      centreId: "cen_vaishali",
+      centreName: "Vaishali Nagar, Jaipur",
+      parentPhone: "+91 90000 12341",
+    });
 
     this.instalments.set(inst1Id, {
       id: inst1Id,
@@ -313,6 +350,17 @@ class DemoPaymentStore {
     // Inst 1: Due 2026-11-15, Paid ₹0.
     const mohitId = "stu_mohit_0219";
     const instMohit1Id = "inst_mohit_1";
+    const instMohit2Id = "inst_mohit_2";
+    const instMohit3Id = "inst_mohit_3";
+
+    this.students.set(mohitId, {
+      id: mohitId,
+      studentCode: "STU-0219",
+      name: "Mohit Gurjar",
+      centreId: "cen_mansarovar",
+      centreName: "Mansarovar, Jaipur",
+      parentPhone: "+91 90000 12342",
+    });
 
     this.instalments.set(instMohit1Id, {
       id: instMohit1Id,
@@ -324,14 +372,52 @@ class DemoPaymentStore {
       status: "DUE",
     });
 
-    this.ledgerEntries.push({
-      id: "led_mohit_chg_1",
+    this.instalments.set(instMohit2Id, {
+      id: instMohit2Id,
       studentId: mohitId,
-      instalmentId: instMohit1Id,
-      entryType: "CHARGE",
+      feePlanId: "plan_mohit_neet",
+      sequence: 2,
+      dueDate: new Date("2026-12-15"),
       amount: 4000000n,
-      entryDate: new Date("2026-06-15"),
+      status: "UPCOMING",
     });
+
+    this.instalments.set(instMohit3Id, {
+      id: instMohit3Id,
+      studentId: mohitId,
+      feePlanId: "plan_mohit_neet",
+      sequence: 3,
+      dueDate: new Date("2027-02-15"),
+      amount: 4000000n,
+      status: "UPCOMING",
+    });
+
+    this.ledgerEntries.push(
+      {
+        id: "led_mohit_chg_1",
+        studentId: mohitId,
+        instalmentId: instMohit1Id,
+        entryType: "CHARGE",
+        amount: 4000000n,
+        entryDate: new Date("2026-06-15"),
+      },
+      {
+        id: "led_mohit_chg_2",
+        studentId: mohitId,
+        instalmentId: instMohit2Id,
+        entryType: "CHARGE",
+        amount: 4000000n,
+        entryDate: new Date("2026-06-15"),
+      },
+      {
+        id: "led_mohit_chg_3",
+        studentId: mohitId,
+        instalmentId: instMohit3Id,
+        entryType: "CHARGE",
+        amount: 4000000n,
+        entryDate: new Date("2026-06-15"),
+      }
+    );
 
     this.intents.set("order_demo_mohit", {
       id: "intent_mohit_demo",
@@ -344,12 +430,55 @@ class DemoPaymentStore {
       status: "PENDING",
       createdAt: new Date(),
     });
+
+  }
+
+  public seedUnmatchedPayment() {
+    // UNMATCHED PAYMENT: pay_demo_a91c (₹15,000, "MOHIT G 0219")
+    this.payments.set("pay_demo_a91c", {
+      id: "pay_demo_a91c",
+      paymentReference: "pay_demo_a91c",
+      provider: "MOCK_GATEWAY",
+      providerPaymentId: "prov_unmatched_a91c",
+      orderId: null,
+      studentId: null,
+      amount: 1500000n,
+      unallocatedAmount: 1500000n,
+      paymentDate: new Date("2026-11-01T16:45:00Z"),
+      method: "NEFT",
+      payerDetails: "MOHIT G 0219 / PUNB0123456",
+      status: "CAPTURED",
+      matchStatus: "UNMATCHED",
+      notes: "Direct bank transfer; potential candidate STU-0219 Mohit Gurjar (score 0.88)",
+    });
+
+    this.recordProviderEvent({
+      provider: "MOCK_GATEWAY",
+      providerEventId: "evt_1101_unmatched",
+      eventType: "payment.captured",
+      payloadJson: JSON.stringify({
+        paymentId: "prov_unmatched_a91c",
+        amount: 1500000,
+        payerDetails: "MOHIT G 0219 / PUNB0123456",
+      }),
+      signatureVerified: true,
+      processed: true,
+      processingStatus: "UNMATCHED",
+    });
   }
 
   public seedKavyaWithdrawalData() {
     // 3. Kavya Rathore (STU-1038): NEET 2027 Morning, Tonk Road
     // 4 x ₹30,000 instalments. All 4 paid = ₹120,000.
     const kavyaId = "stu_kavya_1038";
+    this.students.set(kavyaId, {
+      id: kavyaId,
+      studentCode: "STU-1038",
+      name: "Kavya Rathore",
+      centreId: "cen_tonk",
+      centreName: "Tonk Road, Jaipur",
+      parentPhone: "+91 98290 12345",
+    });
     const kInst1 = "inst_kavya_1";
     const kInst2 = "inst_kavya_2";
     const kInst3 = "inst_kavya_3";
@@ -868,6 +997,51 @@ class DemoPaymentStore {
       existing.lastReceipt = receipt;
     }
     return { attemptCount: newCount, key, receipt };
+  }
+
+  getStudent(id: string): DemoStudent | null {
+    return this.students.get(id) || null;
+  }
+
+  listStudents(): DemoStudent[] {
+    return Array.from(this.students.values());
+  }
+
+  findPaymentById(id: string): DemoPayment | null {
+    return this.payments.get(id) || null;
+  }
+
+  getAllocationsForPayment(paymentId: string): DemoAllocation[] {
+    return this.allocations.filter((a) => a.paymentId === paymentId);
+  }
+
+  getRefundItemsForPayment(paymentId: string): DemoRefundItem[] {
+    return Array.from(this.refundItems.values()).filter((r) => r.paymentId === paymentId);
+  }
+
+  getProviderEventsForPayment(provider: string, providerPaymentId?: string, orderId?: string | null): DemoProviderEvent[] {
+    return Array.from(this.providerEvents.values()).filter((evt) => {
+      if (evt.provider !== provider) return false;
+      if (providerPaymentId && (evt.providerEventId.includes(providerPaymentId) || evt.payloadJson.includes(providerPaymentId))) return true;
+      if (orderId && evt.payloadJson.includes(orderId)) return true;
+      return false;
+    });
+  }
+
+  getUnmatchedPayments(): DemoPayment[] {
+    return Array.from(this.payments.values())
+      .filter((p) => p.matchStatus === "UNMATCHED" || p.unallocatedAmount > 0n)
+      .sort((a, b) => b.paymentDate.getTime() - a.paymentDate.getTime());
+  }
+
+  recordAuditLog(data: Omit<DemoAuditLog, "id" | "createdAt">): DemoAuditLog {
+    const log: DemoAuditLog = {
+      id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      ...data,
+      createdAt: new Date(),
+    };
+    this.auditLogs.push(log);
+    return log;
   }
 }
 

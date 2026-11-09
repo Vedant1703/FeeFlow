@@ -3,27 +3,43 @@ import { z } from "zod";
 import { prisma } from "@/infrastructure/db/prisma";
 import { getSessionActor } from "@/infrastructure/auth/session";
 import { canActorManagePayments } from "@/application/actor";
-import { deriveInstalmentBalance } from "@/domain/ledger";
+import { paymentService } from "@/application/services/payment-service";
+import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
 
-const AllocatePaymentSchema = z.object({
-  paymentId: z.string().min(1, "Payment ID is required"),
+const InstalmentItemSchema = z.object({
   instalmentId: z.string().min(1, "Instalment ID is required"),
-  amountPaise: z.union([z.string(), z.number()]).refine((val) => {
+  amountPaise: z.union([z.string(), z.number(), z.bigint()]).refine((val) => {
     try {
       return BigInt(val) > 0n;
     } catch {
       return false;
     }
   }, "Allocation amount must be a positive integer"),
-  reason: z.string().trim().min(3, "Mandatory audit reason must be at least 3 characters"),
 });
+
+const AllocatePaymentSchema = z
+  .object({
+    paymentId: z.string().min(1, "Payment ID is required"),
+    studentId: z.string().optional(),
+    instalmentId: z.string().optional(),
+    amountPaise: z.union([z.string(), z.number(), z.bigint()]).optional(),
+    allocations: z.array(InstalmentItemSchema).optional(),
+    reason: z.string().trim().min(3, "Mandatory audit reason must be at least 3 characters"),
+    idempotencyKey: z.string().optional(),
+  })
+  .refine(
+    (data) =>
+      (data.allocations && data.allocations.length > 0) ||
+      (data.instalmentId !== undefined && data.amountPaise !== undefined),
+    "Either allocations array or instalmentId with amountPaise is required"
+  );
 
 export async function POST(req: Request) {
   try {
     const actor = await getSessionActor();
     if (!actor || !canActorManagePayments(actor)) {
       return NextResponse.json(
-        { error: "Unauthorized: only Accounts staff can allocate payments" },
+        { error: "Unauthorized: only Accounts and Director staff can allocate payments" },
         { status: 403 }
       );
     }
@@ -38,177 +54,97 @@ export async function POST(req: Request) {
       );
     }
 
-    const { paymentId, instalmentId, amountPaise: rawAmountPaise, reason } = parseResult.data;
-    const amountPaise = BigInt(rawAmountPaise);
+    const {
+      paymentId,
+      studentId: rawStudentId,
+      instalmentId,
+      amountPaise: rawAmountPaise,
+      allocations: rawAllocations,
+      reason,
+      idempotencyKey,
+    } = parseResult.data;
 
-    // Try transactional allocation with PostgreSQL
-    try {
-      const result = await prisma.$transaction(async (tx) => {
-        const payment = await tx.payment.findUnique({
-          where: { id: paymentId },
-        });
-
-        if (!payment) {
-          throw new Error("Payment record not found");
-        }
-
-        if (payment.unallocatedAmount < amountPaise) {
-          throw new Error(
-            `Cannot allocate ${amountPaise} paise: only ${payment.unallocatedAmount} paise unallocated`
-          );
-        }
-
-        const instalment = await tx.instalment.findUnique({
-          where: { id: instalmentId },
-          include: {
-            feePlan: {
-              include: {
-                student: {
-                  include: { ledgerEntries: true, centre: true },
-                },
-              },
-            },
-          },
-        });
-
-        if (!instalment) {
-          throw new Error("Target instalment not found");
-        }
-
-        // Centre scope check
-        if (
-          actor.role === "ACCOUNTS" &&
-          !actor.centreIds.includes(instalment.feePlan.student.centreId)
-        ) {
-          throw new Error("Access denied: student is outside your assigned centre scope");
-        }
-
-        // Check current outstanding on target instalment
-        const student = instalment.feePlan.student;
-        const currentBalance = deriveInstalmentBalance(
-          {
-            id: instalment.id,
-            feePlanId: instalment.feePlanId,
-            sequence: instalment.sequence,
-            dueDate: instalment.dueDate,
-            amount: instalment.amount,
-          },
-          student.ledgerEntries.map((e) => ({ ...e, amount: e.amount })),
-          new Date()
-        );
-
-        if (amountPaise > currentBalance.outstandingBalance) {
-          throw new Error(
-            `Allocation of ${amountPaise} exceeds current outstanding of ${currentBalance.outstandingBalance}`
-          );
-        }
-
-        // 1. Create Allocation record
-        const allocation = await tx.paymentAllocation.create({
-          data: {
-            paymentId: payment.id,
-            instalmentId: instalment.id,
-            amount: amountPaise,
-            allocatedById: actor.userId,
-            allocationReason: reason,
-          },
-        });
-
-        // 2. Append signed Ledger ALLOCATION entry
-        await tx.ledgerEntry.create({
-          data: {
-            studentId: student.id,
-            instalmentId: instalment.id,
-            entryType: "ALLOCATION",
-            amount: -amountPaise,
-            entryDate: new Date(),
-            referenceType: "MANUAL_ALLOCATION",
-            referenceId: payment.id,
-            createdById: actor.userId,
-            notes: `Manual allocation by ${actor.name}: ${reason}`,
-          },
-        });
-
-        // 3. Update Payment record: deduct unallocated amount and attach studentId
-        const newUnallocated = payment.unallocatedAmount - amountPaise;
-        await tx.payment.update({
-          where: { id: payment.id },
-          data: {
-            studentId: student.id,
-            unallocatedAmount: newUnallocated,
-            matchStatus: "MATCHED_MANUAL",
-          },
-        });
-
-        // 4. Update Instalment cached status
-        const newOutstanding = currentBalance.outstandingBalance - amountPaise;
-        await tx.instalment.update({
-          where: { id: instalment.id },
-          data: {
-            status: newOutstanding === 0n ? "PAID" : "PARTIAL",
-          },
-        });
-
-        // 5. Immediate reminder stop if fully settled
-        if (newOutstanding === 0n) {
-          await tx.reminderDispatch.updateMany({
-            where: {
-              instalmentId: instalment.id,
-              status: "QUEUED",
-            },
-            data: {
-              status: "SKIPPED",
-              skipReason: "Instalment settled",
-            },
-          });
-        }
-
-        // 6. Audit log
-        await tx.auditLog.create({
-          data: {
-            actorId: actor.userId,
-            actorEmail: actor.email || actor.name,
-            actorRole: actor.role,
-            action: "PAYMENT_ALLOCATE",
-            entityType: "Payment",
-            entityId: payment.id,
-            centreId: student.centreId,
-            reason,
-            afterJson: JSON.stringify({
-              paymentId: payment.id,
-              studentId: student.id,
-              allocatedPaise: amountPaise.toString(),
-              remainingUnallocated: newUnallocated.toString(),
-            }),
-          },
-        });
-
-        return {
-          allocationId: allocation.id,
-          newOutstanding: newOutstanding.toString(),
-        };
-      });
-
-      return NextResponse.json({
-        success: true,
-        message: "Payment successfully allocated to student instalment",
-        result,
-      });
-    } catch (dbErr: any) {
-      // In demo mode or when local DB is offline, return simulated successful allocation
-      return NextResponse.json({
-        success: true,
-        message: "Payment successfully allocated (demo mode simulated)",
-        result: {
-          allocationId: `alloc_${Date.now()}`,
-          paymentId,
-          instalmentId,
-          allocatedPaise: amountPaise.toString(),
-          reason,
-        },
-      });
+    let allocations: Array<{ instalmentId: string; amountPaise: bigint }> = [];
+    if (rawAllocations && rawAllocations.length > 0) {
+      allocations = rawAllocations.map((a) => ({
+        instalmentId: a.instalmentId,
+        amountPaise: BigInt(a.amountPaise),
+      }));
+    } else if (instalmentId && rawAmountPaise !== undefined) {
+      allocations = [{ instalmentId, amountPaise: BigInt(rawAmountPaise) }];
     }
+
+    // Resolve studentId if not explicitly provided
+    let studentId = rawStudentId;
+    if (!studentId && allocations.length > 0) {
+      try {
+        const firstInst = await prisma.instalment.findUnique({
+          where: { id: allocations[0].instalmentId },
+          include: { feePlan: true },
+        });
+        if (firstInst) {
+          studentId = firstInst.feePlan.studentId;
+        }
+      } catch {
+        const demoInst = demoPaymentStore.instalments.get(allocations[0].instalmentId);
+        if (demoInst) {
+          studentId = demoInst.studentId;
+        }
+      }
+    }
+
+    if (!studentId) {
+      return NextResponse.json(
+        { error: "Target studentId could not be determined" },
+        { status: 400 }
+      );
+    }
+
+    const result = await paymentService.allocatePayment({
+      paymentId,
+      studentId,
+      allocations,
+      reason,
+      actor,
+      idempotencyKey,
+    });
+
+    return NextResponse.json({
+      success: true,
+      message: "Payment successfully allocated to student instalment",
+      result: {
+        paymentId: result.paymentId,
+        studentId: result.studentId,
+        totalAllocatedPaise: result.totalAllocatedPaise.toString(),
+        remainingUnallocatedPaise: result.remainingUnallocatedPaise.toString(),
+        allocations: result.allocations.map((a) => ({
+          allocationId: a.allocationId,
+          instalmentId: a.instalmentId,
+          allocatedPaise: a.allocatedPaise.toString(),
+          newOutstandingPaise: a.newOutstandingPaise.toString(),
+        })),
+      },
+    });
   } catch (err: any) {
+    const msg = String(err.message || "");
+    if (msg.includes("Unauthorized") || msg.includes("Access denied")) {
+      return NextResponse.json({ error: msg }, { status: 403 });
+    }
+    if (msg.includes("not found")) {
+      return NextResponse.json({ error: msg }, { status: 404 });
+    }
+    if (
+      msg.includes("Cannot allocate") ||
+      msg.includes("exceeds") ||
+      msg.includes("Duplicate") ||
+      msg.includes("positive integer") ||
+      msg.includes("required") ||
+      msg.includes("already assigned") ||
+      msg.includes("conflict")
+    ) {
+      return NextResponse.json({ error: msg }, { status: 400 });
+    }
+
     return NextResponse.json(
       { error: err.message || "Failed to allocate payment" },
       { status: 500 }

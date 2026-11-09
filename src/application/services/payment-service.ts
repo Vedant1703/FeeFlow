@@ -27,6 +27,12 @@ import {
 } from "@/domain/ledger";
 import { demoPaymentStore } from "@/infrastructure/db/demo-payment-store";
 import {
+  scorePaymentCandidates,
+  CandidateStudentProfile,
+  MatchCandidateResult,
+} from "@/domain/matching";
+import { canActorManagePayments, canActorAccessStudent } from "@/application/actor";
+import {
   getPaymentProvider,
   PaymentProvider,
   RazorpayPaymentProvider,
@@ -84,6 +90,160 @@ export interface WebhookProcessingResult {
   receiptNumber?: string;
   error?: string;
   message?: string;
+}
+
+export interface InstalmentAllocationInput {
+  instalmentId: string;
+  amountPaise: bigint;
+}
+
+export interface ManualAllocationParams {
+  paymentId: string;
+  studentId: string;
+  allocations: InstalmentAllocationInput[];
+  reason: string;
+  actor: Actor;
+  idempotencyKey?: string;
+}
+
+export interface AllocationItemResult {
+  allocationId: string;
+  instalmentId: string;
+  allocatedPaise: bigint;
+  newOutstandingPaise: bigint;
+}
+
+export interface ManualAllocationResult {
+  success: boolean;
+  paymentId: string;
+  studentId: string;
+  totalAllocatedPaise: bigint;
+  remainingUnallocatedPaise: bigint;
+  allocations: AllocationItemResult[];
+}
+
+export interface UnmatchedPaymentFilters {
+  search?: string;
+  centreId?: string;
+  status?: "ALL" | "UNMATCHED" | "PARTIAL" | "CAPTURED";
+  dateFrom?: string | Date;
+  dateTo?: string | Date;
+}
+
+export interface UnmatchedPaymentItem {
+  id: string;
+  paymentReference: string;
+  provider: string;
+  providerPaymentId: string;
+  orderId: string | null;
+  amount: bigint;
+  unallocatedAmount: bigint;
+  allocatedAmount: bigint;
+  refundedAmount: bigint;
+  availableBalance: bigint;
+  paymentDate: Date;
+  method: string;
+  payerDetails: string | null;
+  status: string;
+  matchStatus: string;
+  notes: string | null;
+  student: {
+    id: string;
+    studentCode: string;
+    name: string;
+    centreId: string;
+    centreName: string;
+  } | null;
+  centre: {
+    id: string;
+    name: string;
+  } | null;
+  topCandidate: MatchCandidateResult | null;
+  candidateCount: number;
+}
+
+export interface PaymentInvestigationDetails {
+  payment: {
+    id: string;
+    paymentReference: string;
+    provider: string;
+    providerPaymentId: string;
+    orderId: string | null;
+    studentId: string | null;
+    amount: bigint;
+    unallocatedAmount: bigint;
+    paymentDate: Date;
+    method: string;
+    payerDetails: string | null;
+    status: string;
+    matchStatus: string;
+    notes: string | null;
+  };
+  student: {
+    id: string;
+    studentCode: string;
+    name: string;
+    centreId: string;
+    centreName: string;
+  } | null;
+  allocations: Array<{
+    id: string;
+    instalmentId: string;
+    sequence: number;
+    amount: bigint;
+    allocatedAt: Date;
+    allocatedById: string | null;
+    allocatedByName?: string | null;
+    allocationReason: string | null;
+  }>;
+  refunds: Array<{
+    id: string;
+    refundId: string;
+    amount: bigint;
+    status: string;
+    providerRefundId: string | null;
+    failureReason: string | null;
+    createdAt: Date;
+  }>;
+  providerEvents: Array<{
+    id: string;
+    provider: string;
+    providerEventId: string;
+    eventType: string;
+    signatureVerified: boolean;
+    processed: boolean;
+    processingStatus: string | null;
+    timestamp: Date;
+  }>;
+  balanceSummary: {
+    capturedAmount: bigint;
+    totalAllocated: bigint;
+    totalRefunded: bigint;
+    availableBalance: bigint;
+  };
+}
+
+export interface StudentOutstandingInstalmentsResult {
+  student: {
+    id: string;
+    studentCode: string;
+    name: string;
+    centreId: string;
+    centreName: string;
+  };
+  feePlan: {
+    id: string;
+    name: string;
+    totalAmount: bigint;
+  } | null;
+  instalments: Array<{
+    id: string;
+    sequence: number;
+    dueDate: Date | string;
+    amount: bigint;
+    outstandingBalance: bigint;
+    status: string;
+  }>;
 }
 
 function isPrismaConnectionError(err: any): boolean {
@@ -1746,6 +1906,1083 @@ export class PaymentService {
       }
       return reprocessed;
     }
+  }
+
+  /**
+   * Manual Payment Allocation (Milestone 5A).
+   * Allocates an unmatched or unallocated payment to one or more instalments
+   * of a student, enforcing append-only signed ledger entries, atomicity,
+   * balance derivation, and audit logging.
+   */
+  async allocatePayment(params: ManualAllocationParams): Promise<ManualAllocationResult> {
+    if (!params.actor || !canActorManagePayments(params.actor)) {
+      throw new Error("Unauthorized: only Accounts and Director staff can allocate payments");
+    }
+
+    if (!params.paymentId) throw new Error("Payment ID is required");
+    if (!params.studentId) throw new Error("Student ID is required");
+    if (!params.allocations || !Array.isArray(params.allocations) || params.allocations.length === 0) {
+      throw new Error("At least one instalment allocation must be provided");
+    }
+    const trimmedReason = (params.reason || "").trim();
+    if (trimmedReason.length < 3) {
+      throw new Error("Mandatory audit reason must be at least 3 characters");
+    }
+
+    const seenInstalments = new Set<string>();
+    let totalToAllocate = 0n;
+    for (const alloc of params.allocations) {
+      if (seenInstalments.has(alloc.instalmentId)) {
+        throw new Error(`Duplicate instalment allocation for ${alloc.instalmentId}`);
+      }
+      seenInstalments.add(alloc.instalmentId);
+      const amt = BigInt(alloc.amountPaise);
+      if (amt <= 0n) {
+        throw new Error("Allocation amount must be a positive integer");
+      }
+      totalToAllocate += amt;
+    }
+
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const payment = await tx.payment.findUnique({
+          where: { id: params.paymentId },
+          include: {
+            allocations: true,
+            refundItems: true,
+          },
+        });
+
+        if (!payment) {
+          throw new Error("Payment record not found");
+        }
+
+        if (payment.status !== "CAPTURED") {
+          throw new Error(
+            `Cannot allocate payment in status ${payment.status}: only CAPTURED payments can be allocated`
+          );
+        }
+
+        if (payment.studentId && payment.studentId !== params.studentId) {
+          throw new Error(
+            `Payment is already assigned to student ${payment.studentId}, cannot allocate to ${params.studentId}`
+          );
+        }
+
+        const totalPriorAllocated = payment.allocations.reduce((sum, a) => sum + a.amount, 0n);
+        const totalSucceededRefunded = payment.refundItems
+          .filter((r) => r.status === "SUCCEEDED")
+          .reduce((sum, r) => sum + r.amount, 0n);
+        const availableBalance = payment.amount - totalPriorAllocated - totalSucceededRefunded;
+
+        if (totalToAllocate > availableBalance) {
+          throw new Error(
+            `Allocation amount (${totalToAllocate} paise) exceeds available payment balance (${availableBalance} paise)`
+          );
+        }
+
+        if (totalToAllocate > payment.unallocatedAmount) {
+          throw new Error(
+            `Cannot allocate ${totalToAllocate} paise: only ${payment.unallocatedAmount} paise unallocated`
+          );
+        }
+
+        const student = await tx.student.findUnique({
+          where: { id: params.studentId },
+          include: {
+            centre: true,
+            ledgerEntries: true,
+          },
+        });
+
+        if (!student) {
+          throw new Error("Student not found");
+        }
+
+        if (params.actor.role === "ACCOUNTS" && !params.actor.centreIds.includes(student.centreId)) {
+          throw new Error("Access denied: student is outside your assigned centre scope");
+        }
+
+        // Atomic decrement for concurrency protection
+        const updatePaymentRes = await tx.payment.updateMany({
+          where: {
+            id: payment.id,
+            unallocatedAmount: { gte: totalToAllocate },
+          },
+          data: {
+            unallocatedAmount: { decrement: totalToAllocate },
+            studentId: student.id,
+            matchStatus: "MATCHED_MANUAL",
+          },
+        });
+
+        if (updatePaymentRes.count === 0) {
+          throw new Error("Concurrent allocation conflict: insufficient unallocated funds");
+        }
+
+        const newUnallocated = payment.unallocatedAmount - totalToAllocate;
+        const allocationResults: AllocationItemResult[] = [];
+        const currentLedgerEntries = [...student.ledgerEntries.map((e) => ({ ...e, amount: e.amount }))];
+
+        for (const alloc of params.allocations) {
+          const amountPaise = BigInt(alloc.amountPaise);
+          const instalment = await tx.instalment.findUnique({
+            where: { id: alloc.instalmentId },
+            include: { feePlan: true },
+          });
+
+          if (!instalment) {
+            throw new Error(`Target instalment ${alloc.instalmentId} not found`);
+          }
+
+          if (instalment.feePlan.studentId !== student.id) {
+            throw new Error(
+              `Instalment ${alloc.instalmentId} does not belong to student ${student.id}`
+            );
+          }
+
+          const currentBalance = deriveInstalmentBalance(
+            {
+              id: instalment.id,
+              feePlanId: instalment.feePlanId,
+              sequence: instalment.sequence,
+              dueDate: instalment.dueDate,
+              amount: instalment.amount,
+            },
+            currentLedgerEntries,
+            new Date()
+          );
+
+          if (amountPaise > currentBalance.outstandingBalance) {
+            throw new Error(
+              `Allocation of ${amountPaise} paise exceeds current outstanding of ${currentBalance.outstandingBalance} paise for instalment ${instalment.sequence}`
+            );
+          }
+
+          const allocRecord = await tx.paymentAllocation.create({
+            data: {
+              paymentId: payment.id,
+              instalmentId: instalment.id,
+              amount: amountPaise,
+              allocatedById: params.actor.userId,
+              allocationReason: trimmedReason,
+            },
+          });
+
+          const ledgerEntry = await tx.ledgerEntry.create({
+            data: {
+              studentId: student.id,
+              instalmentId: instalment.id,
+              entryType: "ALLOCATION",
+              amount: -amountPaise,
+              entryDate: new Date(),
+              referenceType: "MANUAL_ALLOCATION",
+              referenceId: payment.id,
+              createdById: params.actor.userId,
+              notes: `Manual allocation by ${params.actor.name}: ${trimmedReason}`,
+            },
+          });
+
+          currentLedgerEntries.push({ ...ledgerEntry, amount: -amountPaise });
+
+          const newOutstanding = currentBalance.outstandingBalance - amountPaise;
+          await tx.instalment.update({
+            where: { id: instalment.id },
+            data: {
+              status: newOutstanding === 0n ? "PAID" : "PARTIAL",
+            },
+          });
+
+          if (newOutstanding === 0n) {
+            await tx.reminderDispatch.updateMany({
+              where: {
+                instalmentId: instalment.id,
+                status: "QUEUED",
+              },
+              data: {
+                status: "SKIPPED",
+                skipReason: "Instalment settled",
+              },
+            });
+          }
+
+          allocationResults.push({
+            allocationId: allocRecord.id,
+            instalmentId: instalment.id,
+            allocatedPaise: amountPaise,
+            newOutstandingPaise: newOutstanding,
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            actorId: params.actor.userId,
+            actorEmail: params.actor.email || params.actor.name,
+            actorRole: params.actor.role,
+            action: "PAYMENT_ALLOCATE",
+            entityType: "Payment",
+            entityId: payment.id,
+            centreId: student.centreId,
+            reason: trimmedReason,
+            afterJson: JSON.stringify({
+              paymentId: payment.id,
+              studentId: student.id,
+              totalAllocatedPaise: totalToAllocate.toString(),
+              remainingUnallocatedPaise: newUnallocated.toString(),
+              allocations: allocationResults.map((a) => ({
+                allocationId: a.allocationId,
+                instalmentId: a.instalmentId,
+                allocatedPaise: a.allocatedPaise.toString(),
+                newOutstandingPaise: a.newOutstandingPaise.toString(),
+              })),
+            }),
+          },
+        });
+
+        return {
+          success: true,
+          paymentId: payment.id,
+          studentId: student.id,
+          totalAllocatedPaise: totalToAllocate,
+          remainingUnallocatedPaise: newUnallocated,
+          allocations: allocationResults,
+        };
+      });
+    } catch (err: any) {
+      if (!isPrismaConnectionError(err)) {
+        throw err;
+      }
+      return this.allocatePaymentDemoFallback(params, totalToAllocate, trimmedReason);
+    }
+  }
+
+  private allocatePaymentDemoFallback(
+    params: ManualAllocationParams,
+    totalToAllocate: bigint,
+    trimmedReason: string
+  ): ManualAllocationResult {
+    if (params.paymentId === "pay_demo_a91c" && !demoPaymentStore.findPaymentById("pay_demo_a91c")) {
+      demoPaymentStore.seedUnmatchedPayment();
+    }
+    const payment = demoPaymentStore.findPaymentById(params.paymentId);
+    if (!payment) {
+      throw new Error("Payment record not found");
+    }
+
+    if (payment.status !== "CAPTURED") {
+      throw new Error(
+        `Cannot allocate payment in status ${payment.status}: only CAPTURED payments can be allocated`
+      );
+    }
+
+    if (payment.studentId && payment.studentId !== params.studentId) {
+      throw new Error(
+        `Payment is already assigned to student ${payment.studentId}, cannot allocate to ${params.studentId}`
+      );
+    }
+
+    const priorAllocs = demoPaymentStore.getAllocationsForPayment(payment.id);
+    const totalPriorAllocated = priorAllocs.reduce((sum, a) => sum + a.amount, 0n);
+    const refundItems = demoPaymentStore.getRefundItemsForPayment(payment.id);
+    const totalSucceededRefunded = refundItems
+      .filter((r) => r.status === "SUCCEEDED")
+      .reduce((sum, r) => sum + r.amount, 0n);
+    const availableBalance = payment.amount - totalPriorAllocated - totalSucceededRefunded;
+
+    if (totalToAllocate > availableBalance) {
+      throw new Error(
+        `Allocation amount (${totalToAllocate} paise) exceeds available payment balance (${availableBalance} paise)`
+      );
+    }
+
+    if (totalToAllocate > payment.unallocatedAmount) {
+      throw new Error(
+        `Cannot allocate ${totalToAllocate} paise: only ${payment.unallocatedAmount} paise unallocated`
+      );
+    }
+
+    const student = demoPaymentStore.getStudent(params.studentId);
+    if (!student) {
+      throw new Error("Student not found");
+    }
+
+    if (params.actor.role === "ACCOUNTS" && !params.actor.centreIds.includes(student.centreId)) {
+      throw new Error("Access denied: student is outside your assigned centre scope");
+    }
+
+    // Phase 1: Validation of all instalments before any mutations
+    const plannedAllocations: Array<{
+      inst: DomainInstalment & { status: string; studentId: string };
+      amountPaise: bigint;
+      currentBalance: { outstandingBalance: bigint };
+      newOutstanding: bigint;
+    }> = [];
+
+    const runningLedger = [...demoPaymentStore.getStudentLedger(student.id)];
+
+    for (const alloc of params.allocations) {
+      const amountPaise = BigInt(alloc.amountPaise);
+      const inst = demoPaymentStore.instalments.get(alloc.instalmentId);
+      if (!inst) {
+        throw new Error(`Target instalment ${alloc.instalmentId} not found`);
+      }
+
+      if (inst.studentId !== student.id) {
+        throw new Error(
+          `Instalment ${alloc.instalmentId} does not belong to student ${student.id}`
+        );
+      }
+
+      const currentBalance = deriveInstalmentBalance(inst, runningLedger, new Date());
+
+      if (amountPaise > currentBalance.outstandingBalance) {
+        throw new Error(
+          `Allocation of ${amountPaise} paise exceeds current outstanding of ${currentBalance.outstandingBalance} paise for instalment ${inst.sequence}`
+        );
+      }
+
+      const newOutstanding = currentBalance.outstandingBalance - amountPaise;
+      plannedAllocations.push({
+        inst,
+        amountPaise,
+        currentBalance,
+        newOutstanding,
+      });
+
+      // Keep running ledger updated for subsequent allocations in the same batch
+      runningLedger.push({
+        id: `temp_${Date.now()}`,
+        studentId: student.id,
+        instalmentId: inst.id,
+        entryType: "ALLOCATION",
+        amount: -amountPaise,
+        entryDate: new Date(),
+      });
+    }
+
+    // Phase 2: Mutation (all validations have passed!)
+    payment.unallocatedAmount -= totalToAllocate;
+    payment.studentId = student.id;
+    payment.matchStatus = "MATCHED_MANUAL";
+
+    const allocationResults: AllocationItemResult[] = [];
+    for (const plan of plannedAllocations) {
+      const allocRecord = demoPaymentStore.recordAllocation({
+        paymentId: payment.id,
+        instalmentId: plan.inst.id,
+        amount: plan.amountPaise,
+        allocationReason: trimmedReason,
+      });
+
+      demoPaymentStore.appendLedgerEntry({
+        studentId: student.id,
+        instalmentId: plan.inst.id,
+        entryType: "ALLOCATION",
+        amount: -plan.amountPaise,
+        referenceType: "MANUAL_ALLOCATION",
+        referenceId: payment.id,
+        notes: `Manual allocation by ${params.actor.name}: ${trimmedReason}`,
+      });
+
+      demoPaymentStore.updateInstalmentStatus(
+        plan.inst.id,
+        plan.newOutstanding === 0n ? "PAID" : "PARTIAL"
+      );
+
+      if (plan.newOutstanding === 0n) {
+        demoPaymentStore.skipQueuedReminders(plan.inst.id, "Instalment settled");
+      }
+
+      allocationResults.push({
+        allocationId: allocRecord.id,
+        instalmentId: plan.inst.id,
+        allocatedPaise: plan.amountPaise,
+        newOutstandingPaise: plan.newOutstanding,
+      });
+    }
+
+    demoPaymentStore.recordAuditLog({
+      actorId: params.actor.userId,
+      actorEmail: params.actor.email || params.actor.name,
+      actorRole: params.actor.role,
+      action: "PAYMENT_ALLOCATE",
+      entityType: "Payment",
+      entityId: payment.id,
+      centreId: student.centreId,
+      reason: trimmedReason,
+      afterJson: JSON.stringify({
+        paymentId: payment.id,
+        studentId: student.id,
+        totalAllocatedPaise: totalToAllocate.toString(),
+        remainingUnallocatedPaise: payment.unallocatedAmount.toString(),
+        allocations: allocationResults.map((a) => ({
+          allocationId: a.allocationId,
+          instalmentId: a.instalmentId,
+          allocatedPaise: a.allocatedPaise.toString(),
+          newOutstandingPaise: a.newOutstandingPaise.toString(),
+        })),
+      }),
+    });
+
+    return {
+      success: true,
+      paymentId: payment.id,
+      studentId: student.id,
+      totalAllocatedPaise: totalToAllocate,
+      remainingUnallocatedPaise: payment.unallocatedAmount,
+      allocations: allocationResults,
+    };
+  }
+
+  /**
+   * Returns list of unmatched captures and payments with unallocated balances.
+   * Runs the pure candidate matching engine to suggest matching student candidates.
+   */
+  async getUnmatchedPayments(
+    filters?: UnmatchedPaymentFilters,
+    actor?: Actor
+  ): Promise<UnmatchedPaymentItem[]> {
+    try {
+      const whereClause: any = {
+        OR: [{ matchStatus: "UNMATCHED" }, { unallocatedAmount: { gt: 0n } }],
+      };
+
+      if (filters?.status === "UNMATCHED") {
+        whereClause.matchStatus = "UNMATCHED";
+        delete whereClause.OR;
+      } else if (filters?.status === "PARTIAL") {
+        whereClause.unallocatedAmount = { gt: 0n };
+        whereClause.matchStatus = { not: "UNMATCHED" };
+        delete whereClause.OR;
+      }
+
+      if (filters?.dateFrom || filters?.dateTo) {
+        whereClause.paymentDate = {};
+        if (filters.dateFrom) whereClause.paymentDate.gte = new Date(filters.dateFrom);
+        if (filters.dateTo) whereClause.paymentDate.lte = new Date(filters.dateTo);
+      }
+
+      const payments = await prisma.payment.findMany({
+        where: whereClause,
+        include: {
+          student: {
+            include: { centre: true },
+          },
+          allocations: true,
+          refundItems: true,
+        },
+        orderBy: { paymentDate: "desc" },
+      });
+
+      let visiblePayments = payments;
+      if (actor && actor.role === "ACCOUNTS") {
+        visiblePayments = payments.filter((p) => {
+          if (!p.student) return true;
+          return actor.centreIds.includes(p.student.centreId);
+        });
+      }
+
+      if (filters?.centreId) {
+        visiblePayments = visiblePayments.filter((p) => {
+          if (!p.student) return true;
+          return p.student.centreId === filters.centreId;
+        });
+      }
+
+      if (filters?.search) {
+        const query = filters.search.toLowerCase().trim();
+        visiblePayments = visiblePayments.filter((p) => {
+          const matchRef = p.paymentReference.toLowerCase().includes(query);
+          const matchProv = p.providerPaymentId.toLowerCase().includes(query);
+          const matchOrder = p.orderId?.toLowerCase().includes(query) || false;
+          const matchPayer = p.payerDetails?.toLowerCase().includes(query) || false;
+          const matchStudent = p.student
+            ? p.student.name.toLowerCase().includes(query) ||
+              p.student.studentCode.toLowerCase().includes(query)
+            : false;
+          return matchRef || matchProv || matchOrder || matchPayer || matchStudent;
+        });
+      }
+
+      const candidateStudents = await prisma.student.findMany({
+        include: {
+          centre: true,
+          feePlans: {
+            include: {
+              instalments: true,
+            },
+          },
+          ledgerEntries: true,
+        },
+      });
+
+      const candidateProfiles: CandidateStudentProfile[] = candidateStudents.map((s) => {
+        const activePlan = s.feePlans[0];
+        const candidateInstalments: DomainInstalment[] = (activePlan?.instalments || []).map((i) => ({
+          id: i.id,
+          feePlanId: i.feePlanId,
+          sequence: i.sequence,
+          dueDate: i.dueDate,
+          amount: i.amount,
+        }));
+        const nextInstalment = activePlan?.instalments.find(
+          (i) => i.status === "UNPAID" || i.status === "PARTIAL" || (i.status as any) === "DUE"
+        );
+        const summary = deriveStudentLedgerSummary(
+          s.id,
+          candidateInstalments,
+          s.ledgerEntries.map((e) => ({ ...e, amount: e.amount })),
+          new Date()
+        );
+        return {
+          studentId: s.id,
+          studentCode: s.studentCode,
+          name: s.name,
+          centreName: s.centre.name,
+          parentPhone: null,
+          activeInstalmentAmount: nextInstalment?.amount || 0n,
+          outstandingBalance: summary.totalOutstanding,
+        };
+      });
+
+      return visiblePayments.map((p) => {
+        const allocatedAmt = p.allocations.reduce((sum, a) => sum + a.amount, 0n);
+        const refundedAmt = p.refundItems
+          .filter((r) => r.status === "SUCCEEDED")
+          .reduce((sum, r) => sum + r.amount, 0n);
+        const availableBalance = p.amount - allocatedAmt - refundedAmt;
+
+        let topCandidate: MatchCandidateResult | null = null;
+        let candidateCount = 0;
+
+        if (!p.studentId && p.payerDetails) {
+          const evaluation = scorePaymentCandidates(
+            {
+              paymentId: p.id,
+              paymentReference: p.paymentReference,
+              amount: p.amount,
+              payerDetails: p.payerDetails,
+              paymentDate: p.paymentDate,
+            },
+            candidateProfiles
+          );
+          topCandidate = evaluation.topCandidate;
+          candidateCount = evaluation.candidates.length;
+        }
+
+        return {
+          id: p.id,
+          paymentReference: p.paymentReference,
+          provider: p.provider,
+          providerPaymentId: p.providerPaymentId,
+          orderId: p.orderId,
+          amount: p.amount,
+          unallocatedAmount: p.unallocatedAmount,
+          allocatedAmount: allocatedAmt,
+          refundedAmount: refundedAmt,
+          availableBalance,
+          paymentDate: p.paymentDate,
+          method: p.method,
+          payerDetails: p.payerDetails,
+          status: p.status,
+          matchStatus: p.matchStatus,
+          notes: p.notes,
+          student: p.student
+            ? {
+                id: p.student.id,
+                studentCode: p.student.studentCode,
+                name: p.student.name,
+                centreId: p.student.centreId,
+                centreName: p.student.centre.name,
+              }
+            : null,
+          centre: p.student?.centre
+            ? { id: p.student.centre.id, name: p.student.centre.name }
+            : null,
+          topCandidate,
+          candidateCount,
+        };
+      });
+    } catch (err: any) {
+      if (!isPrismaConnectionError(err)) {
+        throw err;
+      }
+      return this.getUnmatchedPaymentsDemoFallback(filters, actor);
+    }
+  }
+
+  private getUnmatchedPaymentsDemoFallback(
+    filters?: UnmatchedPaymentFilters,
+    actor?: Actor
+  ): UnmatchedPaymentItem[] {
+    let payments = demoPaymentStore.getUnmatchedPayments();
+    if (payments.length === 0 && !filters?.search && !filters?.status && !filters?.centreId) {
+      demoPaymentStore.seedUnmatchedPayment();
+      payments = demoPaymentStore.getUnmatchedPayments();
+    }
+
+    if (filters?.status === "UNMATCHED") {
+      payments = payments.filter((p) => p.matchStatus === "UNMATCHED");
+    } else if (filters?.status === "PARTIAL") {
+      payments = payments.filter(
+        (p) => p.unallocatedAmount > 0n && p.matchStatus !== "UNMATCHED"
+      );
+    }
+
+    if (actor && actor.role === "ACCOUNTS") {
+      payments = payments.filter((p) => {
+        if (!p.studentId) return true;
+        const student = demoPaymentStore.getStudent(p.studentId);
+        return student ? actor.centreIds.includes(student.centreId) : true;
+      });
+    }
+
+    if (filters?.search) {
+      const q = filters.search.toLowerCase().trim();
+      payments = payments.filter((p) => {
+        const student = p.studentId ? demoPaymentStore.getStudent(p.studentId) : null;
+        return (
+          p.paymentReference.toLowerCase().includes(q) ||
+          p.providerPaymentId.toLowerCase().includes(q) ||
+          (p.payerDetails && p.payerDetails.toLowerCase().includes(q)) ||
+          (student &&
+            (student.name.toLowerCase().includes(q) ||
+              student.studentCode.toLowerCase().includes(q)))
+        );
+      });
+    }
+
+    const candidateProfiles: CandidateStudentProfile[] = demoPaymentStore
+      .listStudents()
+      .map((s) => {
+        const insts = demoPaymentStore.getStudentInstalments(s.id);
+        const nextInstalment = insts.find((i) => (i.status as any) === "DUE" || i.status === "PARTIAL");
+        const ledger = demoPaymentStore.getStudentLedger(s.id);
+        const summary = deriveStudentLedgerSummary(s.id, insts, ledger, new Date());
+        return {
+          studentId: s.id,
+          studentCode: s.studentCode,
+          name: s.name,
+          centreName: s.centreName,
+          parentPhone: s.parentPhone,
+          activeInstalmentAmount: nextInstalment?.amount || 0n,
+          outstandingBalance: summary.totalOutstanding,
+        };
+      });
+
+    return payments.map((p) => {
+      const student = p.studentId ? demoPaymentStore.getStudent(p.studentId) : null;
+      const allocs = demoPaymentStore.getAllocationsForPayment(p.id);
+      const allocatedAmt = allocs.reduce((sum, a) => sum + a.amount, 0n);
+      const refunds = demoPaymentStore.getRefundItemsForPayment(p.id);
+      const refundedAmt = refunds
+        .filter((r) => r.status === "SUCCEEDED")
+        .reduce((sum, r) => sum + r.amount, 0n);
+      const availableBalance = p.amount - allocatedAmt - refundedAmt;
+
+      let topCandidate: MatchCandidateResult | null = null;
+      let candidateCount = 0;
+
+      if (!p.studentId && p.payerDetails) {
+        const evaluation = scorePaymentCandidates(
+          {
+            paymentId: p.id,
+            paymentReference: p.paymentReference,
+            amount: p.amount,
+            payerDetails: p.payerDetails,
+            paymentDate: p.paymentDate,
+          },
+          candidateProfiles
+        );
+        topCandidate = evaluation.topCandidate;
+        candidateCount = evaluation.candidates.length;
+      }
+
+      return {
+        id: p.id,
+        paymentReference: p.paymentReference,
+        provider: p.provider,
+        providerPaymentId: p.providerPaymentId,
+        orderId: p.orderId || null,
+        amount: p.amount,
+        unallocatedAmount: p.unallocatedAmount,
+        allocatedAmount: allocatedAmt,
+        refundedAmount: refundedAmt,
+        availableBalance,
+        paymentDate: p.paymentDate,
+        method: p.method,
+        payerDetails: p.payerDetails,
+        status: p.status,
+        matchStatus: p.matchStatus,
+        notes: p.notes || null,
+        student: student
+          ? {
+              id: student.id,
+              studentCode: student.studentCode,
+              name: student.name,
+              centreId: student.centreId,
+              centreName: student.centreName,
+            }
+          : null,
+        centre: student ? { id: student.centreId, name: student.centreName } : null,
+        topCandidate,
+        candidateCount,
+      };
+    });
+  }
+
+  /**
+   * Investigation view details for an unmatched or captured payment.
+   * Returns original transaction details, existing allocations, refund items,
+   * associated provider events, and live available balance.
+   */
+  async getPaymentInvestigationDetails(
+    paymentId: string,
+    actor: Actor
+  ): Promise<PaymentInvestigationDetails> {
+    if (!canActorManagePayments(actor)) {
+      throw new Error("Unauthorized: only Accounts and Director staff can investigate payments");
+    }
+
+    try {
+      const payment = await prisma.payment.findUnique({
+        where: { id: paymentId },
+        include: {
+          student: { include: { centre: true } },
+          allocations: {
+            include: { instalment: true },
+            orderBy: { allocatedAt: "desc" },
+          },
+          refundItems: {
+            orderBy: { createdAt: "desc" },
+          },
+        },
+      });
+
+      if (!payment) {
+        throw new Error("Payment record not found");
+      }
+
+      if (payment.student && actor.role === "ACCOUNTS") {
+        if (!actor.centreIds.includes(payment.student.centreId)) {
+          throw new Error("Access denied: student is outside your assigned centre scope");
+        }
+      }
+
+      const providerEvents = await prisma.providerEvent.findMany({
+        where: {
+          provider: payment.provider,
+          OR: [
+            { providerEventId: payment.providerPaymentId },
+            { payloadJson: { contains: payment.providerPaymentId } },
+            ...(payment.orderId ? [{ payloadJson: { contains: payment.orderId } }] : []),
+          ],
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      const totalAllocated = payment.allocations.reduce((sum, a) => sum + a.amount, 0n);
+      const totalRefunded = payment.refundItems
+        .filter((r) => r.status === "SUCCEEDED")
+        .reduce((sum, r) => sum + r.amount, 0n);
+      const availableBalance = payment.amount - totalAllocated - totalRefunded;
+
+      return {
+        payment: {
+          id: payment.id,
+          paymentReference: payment.paymentReference,
+          provider: payment.provider,
+          providerPaymentId: payment.providerPaymentId,
+          orderId: payment.orderId,
+          studentId: payment.studentId,
+          amount: payment.amount,
+          unallocatedAmount: payment.unallocatedAmount,
+          paymentDate: payment.paymentDate,
+          method: payment.method,
+          payerDetails: payment.payerDetails,
+          status: payment.status,
+          matchStatus: payment.matchStatus,
+          notes: payment.notes,
+        },
+        student: payment.student
+          ? {
+              id: payment.student.id,
+              studentCode: payment.student.studentCode,
+              name: payment.student.name,
+              centreId: payment.student.centreId,
+              centreName: payment.student.centre.name,
+            }
+          : null,
+        allocations: payment.allocations.map((a) => ({
+          id: a.id,
+          instalmentId: a.instalmentId,
+          sequence: a.instalment?.sequence || 1,
+          amount: a.amount,
+          allocatedAt: a.allocatedAt,
+          allocatedById: a.allocatedById,
+          allocatedByName: a.allocatedById || "Accounts Staff",
+          allocationReason: a.allocationReason,
+        })),
+        refunds: payment.refundItems.map((r) => ({
+          id: r.id,
+          refundId: r.refundId,
+          amount: r.amount,
+          status: r.status,
+          providerRefundId: r.providerRefundId,
+          failureReason: r.failureReason,
+          createdAt: r.createdAt,
+        })),
+        providerEvents: providerEvents.map((e) => ({
+          id: e.id,
+          provider: e.provider,
+          providerEventId: e.providerEventId,
+          eventType: e.eventType,
+          signatureVerified: e.signatureVerified,
+          processed: e.processed,
+          processingStatus: e.processingStatus,
+          timestamp: e.createdAt,
+        })),
+        balanceSummary: {
+          capturedAmount: payment.amount,
+          totalAllocated,
+          totalRefunded,
+          availableBalance,
+        },
+      };
+    } catch (err: any) {
+      if (!isPrismaConnectionError(err)) {
+        throw err;
+      }
+      return this.getPaymentInvestigationDetailsDemoFallback(paymentId, actor);
+    }
+  }
+
+  private getPaymentInvestigationDetailsDemoFallback(
+    paymentId: string,
+    actor: Actor
+  ): PaymentInvestigationDetails {
+    if (paymentId === "pay_demo_a91c" && !demoPaymentStore.findPaymentById("pay_demo_a91c")) {
+      demoPaymentStore.seedUnmatchedPayment();
+    }
+    const payment = demoPaymentStore.findPaymentById(paymentId);
+    if (!payment) {
+      throw new Error("Payment record not found");
+    }
+
+    const student = payment.studentId ? demoPaymentStore.getStudent(payment.studentId) : null;
+    if (student && actor.role === "ACCOUNTS") {
+      if (!actor.centreIds.includes(student.centreId)) {
+        throw new Error("Access denied: student is outside your assigned centre scope");
+      }
+    }
+
+    const allocs = demoPaymentStore.getAllocationsForPayment(payment.id);
+    const refunds = demoPaymentStore.getRefundItemsForPayment(payment.id);
+    const providerEvents = demoPaymentStore.getProviderEventsForPayment(
+      payment.provider,
+      payment.providerPaymentId,
+      payment.orderId
+    );
+
+    const totalAllocated = allocs.reduce((sum, a) => sum + a.amount, 0n);
+    const totalRefunded = refunds
+      .filter((r) => r.status === "SUCCEEDED")
+      .reduce((sum, r) => sum + r.amount, 0n);
+    const availableBalance = payment.amount - totalAllocated - totalRefunded;
+
+    return {
+      payment: {
+        id: payment.id,
+        paymentReference: payment.paymentReference,
+        provider: payment.provider,
+        providerPaymentId: payment.providerPaymentId,
+        orderId: payment.orderId || null,
+        studentId: payment.studentId || null,
+        amount: payment.amount,
+        unallocatedAmount: payment.unallocatedAmount,
+        paymentDate: payment.paymentDate,
+        method: payment.method,
+        payerDetails: payment.payerDetails,
+        status: payment.status,
+        matchStatus: payment.matchStatus,
+        notes: payment.notes || null,
+      },
+      student: student
+        ? {
+            id: student.id,
+            studentCode: student.studentCode,
+            name: student.name,
+            centreId: student.centreId,
+            centreName: student.centreName,
+          }
+        : null,
+      allocations: allocs.map((a) => {
+        const inst = demoPaymentStore.instalments.get(a.instalmentId);
+        return {
+          id: a.id,
+          instalmentId: a.instalmentId,
+          sequence: inst?.sequence || 1,
+          amount: a.amount,
+          allocatedAt: a.allocatedAt,
+          allocatedById: "usr_accounts_neha",
+          allocatedByName: "Neha Verma",
+          allocationReason: a.allocationReason,
+        };
+      }),
+      refunds: refunds.map((r) => ({
+        id: r.id,
+        refundId: r.refundId,
+        amount: r.amount,
+        status: r.status,
+        providerRefundId: r.providerRefundId || null,
+        failureReason: r.failureReason || null,
+        createdAt: r.createdAt,
+      })),
+      providerEvents: providerEvents.map((e) => ({
+        id: e.id,
+        provider: e.provider,
+        providerEventId: e.providerEventId,
+        eventType: e.eventType,
+        signatureVerified: e.signatureVerified,
+        processed: e.processed,
+        processingStatus: e.processingStatus || null,
+        timestamp: e.processedAt || new Date(),
+      })),
+      balanceSummary: {
+        capturedAmount: payment.amount,
+        totalAllocated,
+        totalRefunded,
+        availableBalance,
+      },
+    };
+  }
+
+  /**
+   * Retrieves outstanding instalments for a student to support manual allocation.
+   */
+  async getStudentOutstandingInstalments(
+    studentId: string,
+    actor: Actor
+  ): Promise<StudentOutstandingInstalmentsResult> {
+    try {
+      const student = await prisma.student.findUnique({
+        where: { id: studentId },
+        include: {
+          centre: true,
+          feePlans: {
+            include: {
+              instalments: {
+                orderBy: { sequence: "asc" },
+              },
+            },
+          },
+          ledgerEntries: true,
+        },
+      });
+
+      if (!student) {
+        throw new Error("Student not found");
+      }
+
+      if (!canActorAccessStudent(actor, student)) {
+        throw new Error("Access denied: student is outside your assigned scope");
+      }
+
+      const activePlan = student.feePlans[0] || null;
+      const instalments = activePlan
+        ? activePlan.instalments.map((inst) => {
+            const balance = deriveInstalmentBalance(
+              {
+                id: inst.id,
+                feePlanId: inst.feePlanId,
+                sequence: inst.sequence,
+                dueDate: inst.dueDate,
+                amount: inst.amount,
+              },
+              student.ledgerEntries.map((e) => ({ ...e, amount: e.amount })),
+              new Date()
+            );
+            return {
+              id: inst.id,
+              sequence: inst.sequence,
+              dueDate: inst.dueDate,
+              amount: inst.amount,
+              outstandingBalance: balance.outstandingBalance,
+              status: balance.outstandingBalance === 0n ? "PAID" : inst.status,
+            };
+          })
+        : [];
+
+      return {
+        student: {
+          id: student.id,
+          studentCode: student.studentCode,
+          name: student.name,
+          centreId: student.centreId,
+          centreName: student.centre.name,
+        },
+        feePlan: activePlan
+          ? {
+              id: activePlan.id,
+              name: activePlan.name,
+              totalAmount: activePlan.netAmount,
+            }
+          : null,
+        instalments,
+      };
+    } catch (err: any) {
+      if (!isPrismaConnectionError(err)) {
+        throw err;
+      }
+      return this.getStudentOutstandingInstalmentsDemoFallback(studentId, actor);
+    }
+  }
+
+  private getStudentOutstandingInstalmentsDemoFallback(
+    studentId: string,
+    actor: Actor
+  ): StudentOutstandingInstalmentsResult {
+    const student = demoPaymentStore.getStudent(studentId);
+    if (!student) {
+      throw new Error("Student not found");
+    }
+
+    if (!canActorAccessStudent(actor, { id: student.id, centreId: student.centreId })) {
+      throw new Error("Access denied: student is outside your assigned scope");
+    }
+
+    const rawInstalments = demoPaymentStore.getStudentInstalments(student.id);
+    const ledger = demoPaymentStore.getStudentLedger(student.id);
+
+    const instalments = rawInstalments.map((inst) => {
+      const balance = deriveInstalmentBalance(inst, ledger, new Date());
+      return {
+        id: inst.id,
+        sequence: inst.sequence,
+        dueDate: inst.dueDate,
+        amount: inst.amount,
+        outstandingBalance: balance.outstandingBalance,
+        status: balance.outstandingBalance === 0n ? "PAID" : inst.status,
+      };
+    });
+
+    const totalAmount = rawInstalments.reduce((sum, i) => sum + i.amount, 0n);
+
+    return {
+      student: {
+        id: student.id,
+        studentCode: student.studentCode,
+        name: student.name,
+        centreId: student.centreId,
+        centreName: student.centreName,
+      },
+      feePlan: {
+        id: `plan_${student.id}`,
+        name: "Standard Fee Plan",
+        totalAmount,
+      },
+      instalments,
+    };
   }
 }
 
