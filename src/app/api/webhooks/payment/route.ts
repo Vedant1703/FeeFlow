@@ -3,15 +3,23 @@ import { paymentService } from "@/application/services/payment-service";
 
 export async function POST(req: Request) {
   try {
-    // Read raw body as text for HMAC signature verification
+    // Read raw body as text for constant-time HMAC signature verification
     const rawBody = await req.text();
 
-    const signatureHeader =
-      req.headers.get("x-feeflow-signature") ||
-      req.headers.get("x-razorpay-signature") ||
-      req.headers.get("x-signature");
+    const razorpaySig = req.headers.get("x-razorpay-signature");
+    const mockSig =
+      req.headers.get("x-feeflow-signature") || req.headers.get("x-signature");
+    const razorpayEventId = req.headers.get("x-razorpay-event-id");
 
-    const result = await paymentService.processWebhook(rawBody, signatureHeader);
+    const isRazorpay = Boolean(razorpaySig);
+    const signature = razorpaySig || mockSig;
+    const provider = isRazorpay ? "RAZORPAY" : "MOCK_GATEWAY";
+
+    const result = await paymentService.processWebhook(rawBody, {
+      provider,
+      signature,
+      eventId: razorpayEventId,
+    });
 
     if (!result.success) {
       return NextResponse.json(

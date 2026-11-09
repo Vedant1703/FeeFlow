@@ -26,6 +26,55 @@ function PaymentStatusContent() {
   const receiptNo = searchParams.get("receipt") || "REC-2026-0587-2";
 
   const [confirmingPollCount, setConfirmingPollCount] = useState(0);
+  const [isChecking, setIsChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
+
+  const checkStatus = React.useCallback(async () => {
+    if (!orderId || isChecking) return;
+    setIsChecking(true);
+    setCheckError(null);
+
+    try {
+      const res = await fetch("/api/payments/reconcile-intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId }),
+      });
+
+      const data = await res.json();
+      setConfirmingPollCount((c) => c + 1);
+
+      if (res.ok && data.success) {
+        if (data.settled) {
+          router.replace(
+            `/parent/payment-status?status=succeeded&orderId=${encodeURIComponent(orderId)}&receipt=${encodeURIComponent(data.receiptNumber || receiptNo)}`
+          );
+        } else if (data.status === "FAILED") {
+          router.replace(
+            `/parent/payment-status?status=failed&orderId=${encodeURIComponent(orderId)}`
+          );
+        }
+      } else if (!res.ok) {
+        setCheckError(data.error || "Failed to check status");
+      }
+    } catch (err: any) {
+      setCheckError(err.message || "Network error checking status");
+    } finally {
+      setIsChecking(false);
+    }
+  }, [orderId, isChecking, receiptNo, router]);
+
+  // Auto-poll every 3 seconds while pending (up to 10 polls)
+  React.useEffect(() => {
+    if (status !== "pending" || !orderId) return;
+
+    if (confirmingPollCount < 10) {
+      const timer = setTimeout(() => {
+        checkStatus();
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [status, orderId, confirmingPollCount, checkStatus]);
 
   return (
     <div className="min-h-screen bg-paper flex flex-col items-center">
@@ -155,12 +204,23 @@ function PaymentStatusContent() {
             <div className="space-y-2 pt-2">
               <button
                 type="button"
-                onClick={() => setConfirmingPollCount((c) => c + 1)}
-                className="w-full h-11 rounded-input border border-line hover:border-teal text-ink font-semibold text-xs transition-colors flex items-center justify-center gap-2"
+                disabled={isChecking}
+                onClick={() => checkStatus()}
+                className="w-full h-11 rounded-input border border-line hover:border-teal text-ink font-semibold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
               >
-                <RotateCcw className="w-4 h-4" />
-                <span>Check status again ({confirmingPollCount} checks)</span>
+                <RotateCcw className={`w-4 h-4 ${isChecking ? "animate-spin" : ""}`} />
+                <span>
+                  {isChecking
+                    ? "Reconciling with gateway..."
+                    : `Check status again (${confirmingPollCount} checks)`}
+                </span>
               </button>
+
+              {checkError && (
+                <div className="text-[11px] text-bad bg-bad-t p-2 rounded text-center">
+                  {checkError}
+                </div>
+              )}
 
               <Link
                 href="/parent"

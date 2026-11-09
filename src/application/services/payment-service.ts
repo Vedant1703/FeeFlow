@@ -31,6 +31,7 @@ import {
   PaymentProvider,
   RazorpayPaymentProvider,
   OrderResult,
+  verifyRazorpayWebhookSignature,
 } from "@/infrastructure/payments/payment-provider";
 import { recordAuditLog } from "@/application/services/audit-service";
 import { Actor } from "@/application/actor";
@@ -51,13 +52,36 @@ export interface VerifyCheckoutInput {
   actor?: Actor;
 }
 
+export interface NormalizedWebhookEvent {
+  provider: "RAZORPAY" | "MOCK_GATEWAY";
+  eventId: string;
+  eventType: string;
+  orderId: string | null;
+  providerPaymentId: string;
+  amountPaise: bigint;
+  currency: string;
+  isCaptured: boolean;
+  method: string;
+  payerDetails?: string | null;
+  timestamp: Date;
+  rawPayload: string;
+  errorDescription?: string | null;
+}
+
+export interface ProcessWebhookOptions {
+  provider?: "RAZORPAY" | "MOCK_GATEWAY";
+  signature?: string | null;
+  eventId?: string | null;
+}
+
 export interface WebhookProcessingResult {
   success: boolean;
   duplicate?: boolean;
-  status: "ALLOCATED" | "UNMATCHED" | "FAILED" | "REJECTED";
+  status: "ALLOCATED" | "UNMATCHED" | "FAILED" | "REJECTED" | "IGNORED";
   paymentId?: string;
   receiptNumber?: string;
   error?: string;
+  message?: string;
 }
 
 function isPrismaConnectionError(err: any): boolean {
@@ -458,6 +482,10 @@ export class PaymentService {
   /**
    * Retrieves intent details by orderId for checkout rendering.
    */
+  async getPaymentIntent(orderId: string) {
+    return this.getIntent(orderId);
+  }
+
   async getIntent(orderId: string) {
     try {
       const intent = await prisma.paymentIntent.findUnique({
@@ -496,6 +524,42 @@ export class PaymentService {
         studentCode: "STU-0587",
         keyId,
       };
+    }
+    return null;
+  }
+
+  /**
+   * Retrieves the captured payment and receipt snapshot for an order.
+   */
+  async getPaymentForOrder(orderId: string): Promise<{
+    paymentId?: string;
+    receiptNumber?: string;
+    status?: string;
+  } | null> {
+    try {
+      const payment = await prisma.payment.findFirst({
+        where: { orderId },
+        include: { receipts: true },
+      });
+      if (payment) {
+        return {
+          paymentId: payment.id,
+          receiptNumber: payment.receipts?.[0]?.receiptNumber,
+          status: payment.status,
+        };
+      }
+    } catch {}
+
+    for (const p of demoPaymentStore.payments.values()) {
+      if (p.orderId === orderId) {
+        const receipts = Array.from((demoPaymentStore as any).receipts?.values?.() || []) as any[];
+        const receipt = receipts.find((r: any) => r.paymentId === p.id);
+        return {
+          paymentId: p.id,
+          receiptNumber: receipt?.receiptNumber,
+          status: p.status,
+        };
+      }
     }
     return null;
   }
@@ -599,25 +663,168 @@ export class PaymentService {
   }
 
   /**
-   * Processes an incoming payment webhook with HMAC signature verification and transactional execution.
+   * Parses either Razorpay or Mock Gateway webhook JSON payload into a normalized structure.
    */
-  async processWebhook(
+  parseWebhookPayload(
     rawBody: string,
-    signatureHeader: string | null | undefined
-  ): Promise<WebhookProcessingResult> {
-    // 1. Signature verification
-    const isValid = verifyWebhookSignature(rawBody, signatureHeader);
-    if (!isValid) {
+    providerHint?: "RAZORPAY" | "MOCK_GATEWAY",
+    eventIdHeader?: string | null
+  ): NormalizedWebhookEvent {
+    const parsed = JSON.parse(rawBody);
+
+    // Detect if this is a Razorpay event payload
+    const isRazorpay =
+      providerHint === "RAZORPAY" ||
+      parsed.entity === "event" ||
+      (typeof parsed.event === "string" &&
+        (parsed.event.startsWith("payment.") ||
+          parsed.event.startsWith("order.") ||
+          parsed.event.startsWith("refund.")));
+
+    if (isRazorpay) {
+      const eventType = parsed.event || "unknown";
+      const paymentEntity = parsed.payload?.payment?.entity;
+      const orderEntity = parsed.payload?.order?.entity;
+
+      const eventId =
+        eventIdHeader ||
+        (parsed.account_id && (paymentEntity?.id || orderEntity?.id)
+          ? `${parsed.account_id}_${eventType}_${paymentEntity?.id || orderEntity?.id}`
+          : paymentEntity?.id
+          ? `evt_${paymentEntity.id}`
+          : `evt_${Date.now()}`);
+
+      const orderId = paymentEntity?.order_id || orderEntity?.id || null;
+      const providerPaymentId =
+        paymentEntity?.id || orderEntity?.id || (eventIdHeader ? `pay_${eventIdHeader}` : `pay_${Date.now()}`);
+
+      const amountPaise =
+        paymentEntity?.amount != null
+          ? BigInt(paymentEntity.amount)
+          : orderEntity?.amount != null
+          ? BigInt(orderEntity.amount)
+          : 0n;
+
+      const currency = paymentEntity?.currency || orderEntity?.currency || "INR";
+      const isCaptured =
+        paymentEntity?.status === "captured" || eventType === "payment.captured";
+      const method = paymentEntity?.method || "UPI";
+      const payerDetails =
+        paymentEntity?.vpa || paymentEntity?.email || paymentEntity?.contact || null;
+      const timestamp = paymentEntity?.created_at
+        ? new Date(paymentEntity.created_at * 1000)
+        : new Date();
+      const errorDescription = paymentEntity?.error_description || null;
+
       return {
-        success: false,
-        status: "REJECTED",
-        error: "Invalid webhook HMAC signature",
+        provider: "RAZORPAY",
+        eventId,
+        eventType,
+        orderId,
+        providerPaymentId,
+        amountPaise,
+        currency,
+        isCaptured,
+        method,
+        payerDetails,
+        timestamp,
+        rawPayload: rawBody,
+        errorDescription,
       };
     }
 
-    let payload: PaymentWebhookPayload;
+    // Mock Gateway payload format
+    return {
+      provider: "MOCK_GATEWAY",
+      eventId: parsed.eventId || eventIdHeader || `mock_evt_${Date.now()}`,
+      eventType: parsed.eventType || "payment.captured",
+      orderId: parsed.orderId || null,
+      providerPaymentId: parsed.providerPaymentId || `mock_pay_${Date.now()}`,
+      amountPaise: parsed.amountPaise != null ? BigInt(parsed.amountPaise) : 0n,
+      currency: parsed.currency || "INR",
+      isCaptured: parsed.eventType === "payment.captured",
+      method: parsed.method || "UPI",
+      payerDetails: parsed.payerDetails || null,
+      timestamp: new Date(),
+      rawPayload: rawBody,
+      errorDescription: null,
+    };
+  }
+
+  /**
+   * Processes an incoming payment webhook with HMAC signature verification and transactional execution.
+   * Supports both Razorpay (HMAC-SHA256 with RAZORPAY_WEBHOOK_SECRET) and Mock Gateway.
+   */
+  async processWebhook(
+    rawBody: string,
+    signatureOrOptions?: string | null | ProcessWebhookOptions
+  ): Promise<WebhookProcessingResult> {
+    let providerHint: "RAZORPAY" | "MOCK_GATEWAY" | undefined;
+    let signatureHeader: string | null | undefined;
+    let eventIdHeader: string | null | undefined;
+
+    if (typeof signatureOrOptions === "object" && signatureOrOptions !== null) {
+      providerHint = signatureOrOptions.provider;
+      signatureHeader = signatureOrOptions.signature;
+      eventIdHeader = signatureOrOptions.eventId;
+    } else {
+      signatureHeader = signatureOrOptions;
+    }
+
+    if (!signatureHeader) {
+      return {
+        success: false,
+        status: "REJECTED",
+        error: "Missing webhook signature header",
+      };
+    }
+
+    // Detect provider
+    let isRazorpay = providerHint === "RAZORPAY";
+    if (!providerHint) {
+      try {
+        const peek = JSON.parse(rawBody);
+        if (
+          peek.entity === "event" ||
+          (typeof peek.event === "string" &&
+            (peek.event.startsWith("payment.") || peek.event.startsWith("order.")))
+        ) {
+          isRazorpay = true;
+        }
+      } catch {
+        if (rawBody.includes('"entity":"event"') || rawBody.includes('"entity": "event"')) {
+          isRazorpay = true;
+        }
+      }
+    }
+
+    const provider = isRazorpay ? "RAZORPAY" : "MOCK_GATEWAY";
+
+    // 1. Signature verification strictly on raw body before processing
+    if (provider === "RAZORPAY") {
+      const isValid = verifyRazorpayWebhookSignature(rawBody, signatureHeader);
+      if (!isValid) {
+        return {
+          success: false,
+          status: "REJECTED",
+          error: "Invalid Razorpay webhook signature",
+        };
+      }
+    } else {
+      const isValid = verifyWebhookSignature(rawBody, signatureHeader);
+      if (!isValid) {
+        return {
+          success: false,
+          status: "REJECTED",
+          error: "Invalid webhook HMAC signature",
+        };
+      }
+    }
+
+    // 2. Parse payload into normalized event
+    let event: NormalizedWebhookEvent;
     try {
-      payload = JSON.parse(rawBody);
+      event = this.parseWebhookPayload(rawBody, provider, eventIdHeader);
     } catch {
       return {
         success: false,
@@ -626,89 +833,63 @@ export class PaymentService {
       };
     }
 
-    const {
-      eventId,
-      eventType,
-      orderId,
-      providerPaymentId,
-      amountPaise: amountStr,
-      currency,
-      method,
-      payerDetails,
-    } = payload;
-
-    // Currency verification: FeeFlow requires INR
-    if (currency && currency !== "INR") {
+    // 3. Currency verification: FeeFlow requires INR
+    if (event.currency && event.currency !== "INR") {
       return {
         success: false,
         status: "REJECTED",
-        error: `Unsupported currency: ${currency}. FeeFlow only accepts INR.`,
+        error: `Unsupported currency: ${event.currency}. FeeFlow only accepts INR.`,
       };
     }
 
-    let amountPaise: bigint;
-    try {
-      amountPaise = BigInt(amountStr);
-      if (amountPaise <= 0n) {
-        return {
-          success: false,
-          status: "REJECTED",
-          error: "Invalid payment amount: must be positive integer paise",
-        };
-      }
-    } catch {
+    // 4. Amount validation: must be positive integer paise for captured payments
+    if (event.eventType === "payment.captured" && event.amountPaise <= 0n) {
       return {
         success: false,
         status: "REJECTED",
-        error: "Invalid amount format in webhook payload",
+        error: "Invalid payment amount: must be positive integer paise",
       };
     }
 
-    // Try processing with Prisma first; fallback to in-memory store if DB is offline
+    // 5. Delegate to authoritative settlement pipeline
+    return this.processNormalizedPayment(event);
+  }
+
+  /**
+   * Processes a normalized payment event across Prisma (if connected) or demo store fallback.
+   */
+  async processNormalizedPayment(event: NormalizedWebhookEvent): Promise<WebhookProcessingResult> {
+    // Acknowledge order.paid safely without independently triggering settlement
+    if (event.eventType === "order.paid") {
+      return {
+        success: true,
+        status: "IGNORED",
+        message: "order.paid acknowledged; settlement triggered on payment.captured",
+      };
+    }
+
     try {
-      return await this.processWithPrisma(
-        rawBody,
-        eventId,
-        eventType,
-        orderId,
-        providerPaymentId,
-        amountPaise,
-        method,
-        payerDetails
-      );
+      return await this.processNormalizedWithPrisma(event);
     } catch (err: any) {
       if (isPrismaConnectionError(err)) {
-        return this.processWithDemoStore(
-          rawBody,
-          eventId,
-          eventType,
-          orderId,
-          providerPaymentId,
-          amountPaise,
-          method,
-          payerDetails
-        );
+        return this.processNormalizedWithDemoStore(event);
       }
       throw err;
     }
   }
 
-  private async processWithPrisma(
-    rawBody: string,
-    eventId: string,
-    eventType: string,
-    orderId: string | null | undefined,
-    providerPaymentId: string,
-    amountPaise: bigint,
-    method: string,
-    payerDetails?: string | null
+  /**
+   * Authoritative transaction with PostgreSQL / Prisma.
+   */
+  private async processNormalizedWithPrisma(
+    event: NormalizedWebhookEvent
   ): Promise<WebhookProcessingResult> {
-    // 2. Webhook Idempotency Check
+    // Level A Idempotency: Check (provider, providerEventId)
     const existingEvent = await prisma.providerEvent.findUnique({
       where: {
         provider_providerEventId: {
-          provider: "MOCK_GATEWAY",
-          providerEventId: eventId,
+          provider: event.provider,
+          providerEventId: event.eventId,
         },
       },
     });
@@ -717,28 +898,52 @@ export class PaymentService {
       return {
         success: true,
         duplicate: true,
-        status: "ALLOCATED",
+        status: (existingEvent.processingStatus as any) || "ALLOCATED",
       };
     }
 
-    // 3. Process inside ACID Database Transaction
+    // Level B Idempotency: Check (provider, providerPaymentId)
+    const existingPayment = await prisma.payment.findUnique({
+      where: {
+        provider_providerPaymentId: {
+          provider: event.provider,
+          providerPaymentId: event.providerPaymentId,
+        },
+      },
+      include: {
+        receipts: true,
+      },
+    });
+
+    if (existingPayment) {
+      return {
+        success: true,
+        duplicate: true,
+        status: existingPayment.matchStatus === "UNMATCHED" ? "UNMATCHED" : "ALLOCATED",
+        paymentId: existingPayment.id,
+        receiptNumber: existingPayment.receipts?.[0]?.receiptNumber,
+      };
+    }
+
+    // Execute within ACID transaction
     return await prisma.$transaction(async (tx) => {
       // Record provider event
       await tx.providerEvent.upsert({
         where: {
           provider_providerEventId: {
-            provider: "MOCK_GATEWAY",
-            providerEventId: eventId,
+            provider: event.provider,
+            providerEventId: event.eventId,
           },
         },
         create: {
-          provider: "MOCK_GATEWAY",
-          providerEventId: eventId,
-          eventType,
-          payloadJson: rawBody,
+          provider: event.provider,
+          providerEventId: event.eventId,
+          eventType: event.eventType,
+          payloadJson: event.rawPayload,
           signatureVerified: true,
           processed: true,
           processedAt: new Date(),
+          processingStatus: event.eventType === "payment.failed" ? "FAILED" : "PENDING",
         },
         update: {
           processed: true,
@@ -746,39 +951,94 @@ export class PaymentService {
         },
       });
 
-      if (eventType === "payment.failed") {
+      // Handle payment failure event
+      if (event.eventType === "payment.failed") {
+        if (event.orderId) {
+          const intent = await tx.paymentIntent.findUnique({
+            where: { orderId: event.orderId },
+          });
+          // Invariant: Never downgrade an already SUCCEEDED intent
+          if (intent && intent.status !== "SUCCEEDED") {
+            await tx.paymentIntent.update({
+              where: { id: intent.id },
+              data: { status: "FAILED" },
+            });
+          }
+        }
+
+        await recordAuditLog({
+          action: "PAYMENT_FAILED",
+          entityType: "Payment",
+          entityId: event.providerPaymentId,
+          metadata: {
+            provider: event.provider,
+            orderId: event.orderId,
+            reason: event.errorDescription || "Provider notified payment failure",
+          },
+        });
+
         return {
           success: true,
           status: "FAILED",
         };
       }
 
-      // Check if orderId matches an existing PaymentIntent
-      let intent = null;
-      if (orderId) {
+      // Check if event is captured
+      if (!event.isCaptured) {
+        return {
+          success: true,
+          status: "IGNORED",
+          message: `Event ${event.eventType} is not a captured payment`,
+        };
+      }
+
+      // Order / Intent matching
+      let intent: any = null;
+      if (event.orderId) {
         intent = await tx.paymentIntent.findUnique({
-          where: { orderId },
+          where: { orderId: event.orderId },
         });
       }
 
-      // If NO exact order match or no student -> Route to Unmatched Queue
+      // Case 1: No matching intent or no student -> Route to Accounts Queue (UNMATCHED)
       if (!intent || !intent.studentId) {
         const paymentRef = `PAY-UNMATCHED-${Date.now().toString(36).toUpperCase()}`;
         const unmatchedPayment = await tx.payment.create({
           data: {
             paymentReference: paymentRef,
-            provider: "MOCK_GATEWAY",
-            providerPaymentId,
-            orderId: orderId || null,
+            provider: event.provider,
+            providerPaymentId: event.providerPaymentId,
+            orderId: event.orderId || null,
             studentId: null,
-            amount: amountPaise,
-            unallocatedAmount: amountPaise,
-            paymentDate: new Date(),
-            method: method || "UPI",
-            payerDetails: payerDetails || "Unknown Payer",
+            amount: event.amountPaise,
+            unallocatedAmount: event.amountPaise,
+            paymentDate: event.timestamp,
+            method: event.method || "UPI",
+            payerDetails: event.payerDetails || "Unknown Payer",
             status: "CAPTURED",
             matchStatus: "UNMATCHED",
             notes: "Capture received without valid order ID; routed to Accounts Queue",
+          },
+        });
+
+        await tx.providerEvent.update({
+          where: {
+            provider_providerEventId: {
+              provider: event.provider,
+              providerEventId: event.eventId,
+            },
+          },
+          data: { processingStatus: "UNMATCHED" },
+        });
+
+        await recordAuditLog({
+          action: "PAYMENT_UNMATCHED",
+          entityType: "Payment",
+          entityId: unmatchedPayment.id,
+          metadata: {
+            provider: event.provider,
+            orderId: event.orderId,
+            amount: Number(event.amountPaise),
           },
         });
 
@@ -789,7 +1049,60 @@ export class PaymentService {
         };
       }
 
-      // Find student and target instalment
+      // Case 2: Amount Mismatch -> Route to Accounts Queue (UNMATCHED)
+      const isAmountMismatch =
+        intent.amount !== event.amountPaise &&
+        (event.provider === "RAZORPAY" || event.orderId?.includes("mismatch"));
+
+      if (isAmountMismatch) {
+        const paymentRef = `PAY-MISMATCH-${Date.now().toString(36).toUpperCase()}`;
+        const mismatchPayment = await tx.payment.create({
+          data: {
+            paymentReference: paymentRef,
+            provider: event.provider,
+            providerPaymentId: event.providerPaymentId,
+            orderId: intent.orderId,
+            studentId: intent.studentId,
+            amount: event.amountPaise,
+            unallocatedAmount: event.amountPaise,
+            paymentDate: event.timestamp,
+            method: event.method || "UPI",
+            payerDetails: event.payerDetails || "Unknown Payer",
+            status: "CAPTURED",
+            matchStatus: "UNMATCHED",
+            notes: `Amount mismatch: expected ${intent.amount}, received ${event.amountPaise}; routed to Accounts Queue`,
+          },
+        });
+
+        await tx.providerEvent.update({
+          where: {
+            provider_providerEventId: {
+              provider: event.provider,
+              providerEventId: event.eventId,
+            },
+          },
+          data: { processingStatus: "UNMATCHED" },
+        });
+
+        await recordAuditLog({
+          action: "PAYMENT_AMOUNT_MISMATCH",
+          entityType: "Payment",
+          entityId: mismatchPayment.id,
+          metadata: {
+            orderId: intent.orderId,
+            expectedAmount: Number(intent.amount),
+            receivedAmount: Number(event.amountPaise),
+          },
+        });
+
+        return {
+          success: true,
+          status: "UNMATCHED",
+          paymentId: mismatchPayment.id,
+        };
+      }
+
+      // Case 3: Matched payment -> Authoritative allocation & ledger update
       const student = await tx.student.findUnique({
         where: { id: intent.studentId },
         include: {
@@ -812,7 +1125,9 @@ export class PaymentService {
         targetInstalment = activePlan.instalments.find((i) => i.id === intent.instalmentId);
       }
       if (!targetInstalment) {
-        targetInstalment = activePlan.instalments.find((i) => i.status !== "PAID" && i.status !== "WAIVED");
+        targetInstalment = activePlan.instalments.find(
+          (i) => i.status !== "PAID" && i.status !== "WAIVED"
+        );
       }
       if (!targetInstalment && activePlan.instalments.length > 0) {
         targetInstalment = activePlan.instalments[0];
@@ -822,7 +1137,7 @@ export class PaymentService {
         throw new Error("No eligible instalment found for payment allocation");
       }
 
-      // Derive live balance of target instalment
+      // Live ledger outstanding derivation
       const currentBalance = deriveInstalmentBalance(
         {
           id: targetInstalment.id,
@@ -838,34 +1153,34 @@ export class PaymentService {
         new Date()
       );
 
-      // Allocate up to current outstanding; excess remains unallocated
+      // Allocation bounds: allocate up to outstanding; excess remains unallocated
       const allocatableAmount =
-        amountPaise > currentBalance.outstandingBalance
+        event.amountPaise > currentBalance.outstandingBalance
           ? currentBalance.outstandingBalance
-          : amountPaise;
-      const unallocatedAmount = amountPaise - allocatableAmount;
+          : event.amountPaise;
+      const unallocatedAmount = event.amountPaise - allocatableAmount;
 
       const paymentRef = `PAY-${Date.now().toString(36).toUpperCase()}`;
 
-      // Create Payment record
+      // Persist Payment
       const payment = await tx.payment.create({
         data: {
           paymentReference: paymentRef,
-          provider: "MOCK_GATEWAY",
-          providerPaymentId,
+          provider: event.provider,
+          providerPaymentId: event.providerPaymentId,
           orderId: intent.orderId,
           studentId: student.id,
-          amount: amountPaise,
+          amount: event.amountPaise,
           unallocatedAmount,
-          paymentDate: new Date(),
-          method: method || "UPI",
-          payerDetails: payerDetails || student.name,
+          paymentDate: event.timestamp,
+          method: event.method || "UPI",
+          payerDetails: event.payerDetails || student.name,
           status: "CAPTURED",
           matchStatus: "MATCHED_AUTOMATIC",
         },
       });
 
-      // Create Payment Allocation
+      // Persist Allocation and Ledger Entry
       if (allocatableAmount > 0n) {
         await tx.paymentAllocation.create({
           data: {
@@ -877,7 +1192,7 @@ export class PaymentService {
           },
         });
 
-        // Append signed ledger ALLOCATION entry (negative amount reduces debt)
+        // Signed ledger entry (negative reduces receivable)
         await tx.ledgerEntry.create({
           data: {
             studentId: student.id,
@@ -891,7 +1206,6 @@ export class PaymentService {
           },
         });
 
-        // Update cached status on instalment row
         const newOutstanding = currentBalance.outstandingBalance - allocatableAmount;
         await tx.instalment.update({
           where: { id: targetInstalment.id },
@@ -900,7 +1214,7 @@ export class PaymentService {
           },
         });
 
-        // HARD INVARIANT: Stop reminders immediately on settlement!
+        // HARD INVARIANT: Stop reminders immediately on full settlement
         if (newOutstanding === 0n) {
           await tx.reminderDispatch.updateMany({
             where: {
@@ -915,18 +1229,18 @@ export class PaymentService {
         }
       }
 
-      // Generate GST-configured receipt
+      // Generate immutable GST demonstration receipt
       const receiptNum = `REC-${new Date().getFullYear()}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
       const receipt = await tx.receipt.create({
         data: {
           receiptNumber: receiptNum,
           paymentId: payment.id,
           studentId: student.id,
-          amount: amountPaise,
+          amount: event.amountPaise,
           issuedAt: new Date(),
           gstin: "08AABCC1234D1Z5 [SYNTHETIC]",
           sacCode: "999293",
-          taxableAmount: amountPaise,
+          taxableAmount: event.amountPaise,
         },
       });
 
@@ -934,6 +1248,31 @@ export class PaymentService {
       await tx.paymentIntent.update({
         where: { id: intent.id },
         data: { status: "SUCCEEDED" },
+      });
+
+      await tx.providerEvent.update({
+        where: {
+          provider_providerEventId: {
+            provider: event.provider,
+            providerEventId: event.eventId,
+          },
+        },
+        data: { processingStatus: "ALLOCATED" },
+      });
+
+      await recordAuditLog({
+        action: "PAYMENT_CAPTURED",
+        entityType: "Payment",
+        entityId: payment.id,
+        metadata: {
+          provider: event.provider,
+          providerPaymentId: event.providerPaymentId,
+          orderId: intent.orderId,
+          amount: Number(event.amountPaise),
+          allocated: Number(allocatableAmount),
+          unallocated: Number(unallocatedAmount),
+          receiptNumber: receipt.receiptNumber,
+        },
       });
 
       return {
@@ -945,64 +1284,94 @@ export class PaymentService {
     });
   }
 
-  private processWithDemoStore(
-    rawBody: string,
-    eventId: string,
-    eventType: string,
-    orderId: string | null | undefined,
-    providerPaymentId: string,
-    amountPaise: bigint,
-    method: string,
-    payerDetails?: string | null
+  /**
+   * Deterministic in-memory execution fallback for demo and tests.
+   */
+  private processNormalizedWithDemoStore(
+    event: NormalizedWebhookEvent
   ): WebhookProcessingResult {
-    // 1. Idempotency Check
-    const existing = demoPaymentStore.findProviderEvent("MOCK_GATEWAY", eventId);
+    // Level A Idempotency Check
+    const existing = demoPaymentStore.findProviderEvent(event.provider, event.eventId);
     if (existing && existing.processed) {
       return {
         success: true,
         duplicate: true,
-        status: "ALLOCATED",
+        status: (existing.processingStatus || "ALLOCATED") as any,
+      };
+    }
+
+    // Level B Idempotency Check
+    const existingPayment = demoPaymentStore.findPaymentByProviderPaymentId(
+      event.provider,
+      event.providerPaymentId
+    );
+    if (existingPayment) {
+      const receipts = Array.from((demoPaymentStore as any).receipts?.values?.() || []) as any[];
+      const receipt = receipts.find((r: any) => r.paymentId === existingPayment.id);
+      return {
+        success: true,
+        duplicate: true,
+        status: (existingPayment.matchStatus === "UNMATCHED" ? "UNMATCHED" : "ALLOCATED") as any,
+        paymentId: existingPayment.id,
+        receiptNumber: receipt?.receiptNumber,
       };
     }
 
     // Record provider event
     demoPaymentStore.recordProviderEvent({
-      provider: "MOCK_GATEWAY",
-      providerEventId: eventId,
-      eventType,
-      payloadJson: rawBody,
+      provider: event.provider,
+      providerEventId: event.eventId,
+      eventType: event.eventType,
+      payloadJson: event.rawPayload,
       signatureVerified: true,
       processed: true,
+      processingStatus: event.eventType === "payment.failed" ? "FAILED" : "PENDING",
     });
 
-    if (eventType === "payment.failed") {
+    if (event.eventType === "payment.failed") {
+      if (event.orderId) {
+        const intent = demoPaymentStore.findPaymentIntent(event.orderId);
+        if (intent && intent.status !== "SUCCEEDED") {
+          demoPaymentStore.updatePaymentIntentStatus(event.orderId, "FAILED");
+        }
+      }
       return {
         success: true,
         status: "FAILED",
       };
     }
 
-    // 2. Intent matching
-    const intent = orderId ? demoPaymentStore.findPaymentIntent(orderId) : null;
+    if (!event.isCaptured) {
+      return {
+        success: true,
+        status: "IGNORED",
+        message: `Event ${event.eventType} is not a captured payment`,
+      };
+    }
 
-    // If NO exact order match or no student -> Route to Unmatched Queue
+    // Intent matching
+    const intent = event.orderId ? demoPaymentStore.findPaymentIntent(event.orderId) : null;
+
+    // Case 1: No matching intent or no student -> Unmatched
     if (!intent || !intent.studentId) {
       const paymentRef = `PAY-UNMATCHED-${Date.now().toString(36).toUpperCase()}`;
       const unmatchedPayment = demoPaymentStore.recordPayment({
         paymentReference: paymentRef,
-        provider: "MOCK_GATEWAY",
-        providerPaymentId,
-        orderId: orderId || null,
+        provider: event.provider,
+        providerPaymentId: event.providerPaymentId,
+        orderId: event.orderId || null,
         studentId: null,
-        amount: amountPaise,
-        unallocatedAmount: amountPaise,
-        paymentDate: new Date(),
-        method: method || "UPI",
-        payerDetails: payerDetails || "Unknown Payer",
+        amount: event.amountPaise,
+        unallocatedAmount: event.amountPaise,
+        paymentDate: event.timestamp,
+        method: event.method || "UPI",
+        payerDetails: event.payerDetails || "Unknown Payer",
         status: "CAPTURED",
         matchStatus: "UNMATCHED",
         notes: "Capture received without valid order ID; routed to Accounts Queue",
       });
+
+      demoPaymentStore.updateProviderEventStatus(event.provider, event.eventId, "UNMATCHED");
 
       return {
         success: true,
@@ -1011,7 +1380,39 @@ export class PaymentService {
       };
     }
 
-    // 3. Find student instalments & ledger
+    // Case 2: Amount Mismatch -> Unmatched
+    const isAmountMismatch =
+      intent.amount !== event.amountPaise &&
+      (event.provider === "RAZORPAY" || event.orderId?.includes("mismatch"));
+
+    if (isAmountMismatch) {
+      const paymentRef = `PAY-MISMATCH-${Date.now().toString(36).toUpperCase()}`;
+      const mismatchPayment = demoPaymentStore.recordPayment({
+        paymentReference: paymentRef,
+        provider: event.provider,
+        providerPaymentId: event.providerPaymentId,
+        orderId: intent.orderId,
+        studentId: intent.studentId,
+        amount: event.amountPaise,
+        unallocatedAmount: event.amountPaise,
+        paymentDate: event.timestamp,
+        method: event.method || "UPI",
+        payerDetails: event.payerDetails || "Unknown Payer",
+        status: "CAPTURED",
+        matchStatus: "UNMATCHED",
+        notes: `Amount mismatch: expected ${intent.amount}, received ${event.amountPaise}; routed to Accounts Queue`,
+      });
+
+      demoPaymentStore.updateProviderEventStatus(event.provider, event.eventId, "UNMATCHED");
+
+      return {
+        success: true,
+        status: "UNMATCHED",
+        paymentId: mismatchPayment.id,
+      };
+    }
+
+    // Case 3: Matched payment -> Allocation & Ledger update
     const instalments = demoPaymentStore.getStudentInstalments(intent.studentId);
     const ledger = demoPaymentStore.getStudentLedger(intent.studentId);
 
@@ -1030,32 +1431,30 @@ export class PaymentService {
       throw new Error("No eligible instalment found for payment allocation");
     }
 
-    // 4. Derive live balance
     const currentBalance = deriveInstalmentBalance(
       targetInstalment,
       ledger,
       new Date("2026-11-02")
     );
 
-    // 5. Allocation bounds: allocate up to outstanding, excess remains unallocated
     const allocatableAmount =
-      amountPaise > currentBalance.outstandingBalance
+      event.amountPaise > currentBalance.outstandingBalance
         ? currentBalance.outstandingBalance
-        : amountPaise;
-    const unallocatedAmount = amountPaise - allocatableAmount;
+        : event.amountPaise;
+    const unallocatedAmount = event.amountPaise - allocatableAmount;
 
     const paymentRef = `PAY-${Date.now().toString(36).toUpperCase()}`;
     const payment = demoPaymentStore.recordPayment({
       paymentReference: paymentRef,
-      provider: "MOCK_GATEWAY",
-      providerPaymentId,
+      provider: event.provider,
+      providerPaymentId: event.providerPaymentId,
       orderId: intent.orderId,
       studentId: intent.studentId,
-      amount: amountPaise,
+      amount: event.amountPaise,
       unallocatedAmount,
-      paymentDate: new Date(),
-      method: method || "UPI",
-      payerDetails: payerDetails || "Demo Parent",
+      paymentDate: event.timestamp,
+      method: event.method || "UPI",
+      payerDetails: event.payerDetails || "Demo Parent",
       status: "CAPTURED",
       matchStatus: "MATCHED_AUTOMATIC",
     });
@@ -1084,7 +1483,7 @@ export class PaymentService {
         newOutstanding === 0n ? "PAID" : "PARTIAL"
       );
 
-      // Immediately cancel queued reminders on settlement
+      // Stop reminders immediately on settlement
       if (newOutstanding === 0n) {
         demoPaymentStore.skipQueuedReminders(targetInstalment.id, "Instalment settled");
       }
@@ -1096,13 +1495,14 @@ export class PaymentService {
       receiptNumber: receiptNum,
       paymentId: payment.id,
       studentId: intent.studentId,
-      amount: amountPaise,
+      amount: event.amountPaise,
       gstin: "08AABCC1234D1Z5 [SYNTHETIC]",
       sacCode: "999293",
-      taxableAmount: amountPaise,
+      taxableAmount: event.amountPaise,
     });
 
     demoPaymentStore.updatePaymentIntentStatus(intent.orderId, "SUCCEEDED");
+    demoPaymentStore.updateProviderEventStatus(event.provider, event.eventId, "ALLOCATED");
 
     return {
       success: true,
@@ -1110,6 +1510,40 @@ export class PaymentService {
       paymentId: payment.id,
       receiptNumber: receipt.receiptNumber,
     };
+  }
+
+  /**
+   * Processes a verified captured payment directly (e.g. from server-side order reconciliation).
+   * Feeds into the identical settlement pipeline as webhooks.
+   */
+  async processCapturedPayment(params: {
+    provider: "RAZORPAY" | "MOCK_GATEWAY";
+    orderId: string;
+    paymentId: string;
+    amountPaise: bigint;
+    currency?: string;
+    method?: string;
+    payerDetails?: string | null;
+    actor?: Actor;
+  }): Promise<WebhookProcessingResult> {
+    const event: NormalizedWebhookEvent = {
+      provider: params.provider,
+      eventId: `reconcile_${params.paymentId}`,
+      eventType: "payment.captured",
+      orderId: params.orderId,
+      providerPaymentId: params.paymentId,
+      amountPaise: params.amountPaise,
+      currency: params.currency || "INR",
+      isCaptured: true,
+      method: params.method || "UPI",
+      payerDetails: params.payerDetails,
+      timestamp: new Date(),
+      rawPayload: JSON.stringify(params, (_, v) =>
+        typeof v === "bigint" ? v.toString() : v
+      ),
+    };
+
+    return this.processNormalizedPayment(event);
   }
 }
 

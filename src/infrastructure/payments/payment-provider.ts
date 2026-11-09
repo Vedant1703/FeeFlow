@@ -27,6 +27,52 @@ export interface PaymentProvider {
   readonly providerName: "MOCK_GATEWAY" | "RAZORPAY";
   createOrder(input: CreateOrderInput): Promise<OrderResult>;
   verifyCheckoutSignature(input: VerifyCheckoutSignatureInput): boolean;
+  fetchOrderPayments?(orderId: string): Promise<any[]>;
+}
+
+/**
+ * Constant-time verification of Razorpay webhook signature:
+ * HMAC_SHA256(rawBody, secret)
+ */
+export function verifyRazorpayWebhookSignature(
+  rawBody: string,
+  signatureHeader: string | null | undefined,
+  secret?: string
+): boolean {
+  if (!rawBody || !signatureHeader) {
+    return false;
+  }
+  const webhookSecret = (
+    secret ||
+    process.env.RAZORPAY_WEBHOOK_SECRET ||
+    ""
+  )
+    .trim()
+    .replace(/^["\x27]|["\x27]$/g, "");
+
+  if (!webhookSecret) {
+    console.error("[Razorpay Webhook Error] RAZORPAY_WEBHOOK_SECRET is not configured");
+    return false;
+  }
+
+  try {
+    const trimmedSig = signatureHeader.trim();
+    const expected = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(rawBody)
+      .digest("hex");
+
+    const sigBuf = Buffer.from(trimmedSig);
+    const expBuf = Buffer.from(expected);
+
+    if (sigBuf.length !== expBuf.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(sigBuf, expBuf);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -94,6 +140,10 @@ export class MockPaymentProvider implements PaymentProvider {
       verifyRazorpaySignature(input.orderId, input.paymentId, input.signature, secret) ||
       input.signature.startsWith("sig_mock_")
     );
+  }
+
+  async fetchOrderPayments(orderId: string): Promise<any[]> {
+    return [];
   }
 }
 
@@ -217,6 +267,26 @@ export class RazorpayPaymentProvider implements PaymentProvider {
       this.keySecret
     );
   }
+
+  async fetchOrderPayments(orderId: string): Promise<any[]> {
+    const authHeader = `Basic ${Buffer.from(`${this.keyId}:${this.keySecret}`).toString("base64")}`;
+    const res = await fetch(
+      `https://api.razorpay.com/v1/orders/${encodeURIComponent(orderId)}/payments`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: authHeader,
+        },
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(`Failed to fetch order payments from Razorpay: HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    return data.items || [];
+  }
 }
 
 /**
@@ -257,3 +327,4 @@ export function getPaymentProvider(
 
   return new MockPaymentProvider();
 }
+

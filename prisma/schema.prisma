@@ -356,6 +356,8 @@ model ProviderEvent {
   signatureVerified Boolean   @default(false)
   processed         Boolean   @default(false)
   processedAt       DateTime?
+  processingStatus  String?   @default("PENDING")
+  error             String?
   createdAt         DateTime  @default(now())
 
   @@unique([provider, providerEventId])
@@ -384,6 +386,7 @@ model Payment {
   receipts    Receipt[]
   refundItems RefundItem[]
 
+  @@unique([provider, providerPaymentId])
   @@index([studentId])
   @@index([matchStatus])
 }

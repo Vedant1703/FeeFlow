@@ -30,6 +30,8 @@ export interface DemoProviderEvent {
   signatureVerified: boolean;
   processed: boolean;
   processedAt?: Date;
+  processingStatus?: string;
+  error?: string;
 }
 
 export interface DemoPayment {
@@ -341,6 +343,8 @@ class DemoPaymentStore {
     payloadJson: string;
     signatureVerified: boolean;
     processed: boolean;
+    processingStatus?: string;
+    error?: string;
   }): DemoProviderEvent {
     const key = `${data.provider}:${data.providerEventId}`;
     const event: DemoProviderEvent = {
@@ -352,6 +356,20 @@ class DemoPaymentStore {
     return event;
   }
 
+  updateProviderEventStatus(
+    provider: string,
+    providerEventId: string,
+    status: string,
+    error?: string
+  ): void {
+    const key = `${provider}:${providerEventId}`;
+    const event = this.providerEvents.get(key);
+    if (event) {
+      event.processingStatus = status;
+      if (error) event.error = error;
+    }
+  }
+
   getStudentLedger(studentId: string): DomainLedgerEntry[] {
     return this.ledgerEntries.filter((e) => e.studentId === studentId);
   }
@@ -360,6 +378,15 @@ class DemoPaymentStore {
     return Array.from(this.instalments.values())
       .filter((i) => i.studentId === studentId)
       .sort((a, b) => a.sequence - b.sequence);
+  }
+
+  findPaymentByProviderPaymentId(provider: string, providerPaymentId: string): DemoPayment | null {
+    for (const p of this.payments.values()) {
+      if (p.provider === provider && p.providerPaymentId === providerPaymentId) {
+        return p;
+      }
+    }
+    return null;
   }
 
   recordPayment(data: {
@@ -377,6 +404,10 @@ class DemoPaymentStore {
     matchStatus: "MATCHED_AUTOMATIC" | "UNMATCHED";
     notes?: string;
   }): DemoPayment {
+    const existing = this.findPaymentByProviderPaymentId(data.provider, data.providerPaymentId);
+    if (existing) {
+      throw new Error(`Payment with providerPaymentId ${data.providerPaymentId} already exists`);
+    }
     const id = `pay_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const payment: DemoPayment = {
       id,
@@ -454,6 +485,11 @@ class DemoPaymentStore {
     sacCode: string;
     taxableAmount: bigint;
   }): DemoReceipt {
+    for (const r of this.receipts.values()) {
+      if (r.paymentId === data.paymentId) {
+        throw new Error(`Unique constraint failed: Receipt already issued for paymentId ${data.paymentId}`);
+      }
+    }
     const id = `rec_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const receipt: DemoReceipt = {
       id,
